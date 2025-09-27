@@ -1,4 +1,3 @@
-
 import os
 import uuid
 from jose import jwt
@@ -18,6 +17,7 @@ from langgraph.graph import START, MessagesState, StateGraph
 
 load_dotenv()
 
+# --- Environment Variable Checks (Critical for Deployment) ---
 if "LANGSMITH_API_KEY" not in os.environ:
     if not os.getenv("LANGSMITH_API_KEY"):
         raise EnvironmentError("LANGSMITH_API_KEY environment variable is missing. Deployment aborted.")
@@ -28,7 +28,9 @@ if "LANGSMITH_PROJECT" not in os.environ:
 if "GOOGLE_API_KEY" not in os.environ:
     if not os.getenv("GOOGLE_API_KEY"):
         raise EnvironmentError("GOOGLE_API_KEY environment variable is missing. Deployment aborted.")
-
+        
+if "SECRET_KEY" not in os.environ:
+    raise EnvironmentError("SECRET_KEY environment variable is missing. Deployment aborted.")
 
 app = FastAPI()
 
@@ -39,24 +41,40 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 30
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-DB_USER = os.getenv("POSTGRES_USER")
-DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
-DB_HOST = os.getenv("POSTGRES_HOST")
-DB_PORT = os.getenv("POSTGRES_PORT")
-DB_NAME = os.getenv("POSTGRES_DB")
+# ------------------------------------------------------------------
+# --- FIXED: POSTGRESQL CONNECTION (Using single DATABASE_URL) ---
+# ------------------------------------------------------------------
 
-postgres_url = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-engine = create_engine(postgres_url, echo=False)
+# Get the full URL directly from the environment variable set on Render
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise EnvironmentError("DATABASE_URL environment variable is missing. Database connection aborted.")
+
+# Create the engine using the complete URL
+engine = create_engine(DATABASE_URL, echo=False)
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = os.getenv("REDIS_PORT", "6379")
+# ------------------------------------------------------------------
+# --- FIXED: REDIS CONNECTION (Using single REDIS_URL from Upstash) ---
+# ------------------------------------------------------------------
+
+REDIS_URL = os.getenv("REDIS_URL")
 
 redis_client = None 
 try:
-    redis_client = redis.Redis(host=REDIS_HOST, port=int(REDIS_PORT), db=0, decode_responses=True)
+    if not REDIS_URL:
+        # If the variable is missing, skip trying to connect and fall back to in-memory
+        raise redis.exceptions.ConnectionError("REDIS_URL not set in environment.")
+
+    # redis.from_url() handles the full URL (host, port, user, password) automatically
+    redis_client = redis.from_url(
+        REDIS_URL,
+        db=0,
+        decode_responses=True
+    )
     redis_client.ping()
     memory = RedisSaver(redis_client=redis_client) 
 except redis.exceptions.ConnectionError as e:
@@ -64,6 +82,8 @@ except redis.exceptions.ConnectionError as e:
     print("Falling back to in-memory storage. Chat history will not persist.")
     from langgraph.checkpoint.memory import MemorySaver
     memory = MemorySaver()
+
+# --- Authentication Functions (No Change) ---
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -108,6 +128,8 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token")
     return user_id
 
+# --- Redis Chat Context Functions (No Change) ---
+
 def save_initial_chat_context(user_id: str, ideal_friend: str, buddy_name: str):
     """Saves the user's defined ideal friend characteristics and name to Redis."""
     if redis_client:
@@ -128,8 +150,14 @@ def get_chat_history(user_id: str):
 
     if redis_client:
         context_data = redis_client.hgetall(f"context:{user_id}")
-        ideal_friend = context_data.get("ideal_friend")
-        buddy_name = context_data.get("buddy_name")
+        ideal_friend = context_data.get(b"ideal_friend")
+        buddy_name = context_data.get(b"buddy_name")
+        
+        # Decode bytes if necessary
+        if isinstance(ideal_friend, bytes):
+            ideal_friend = ideal_friend.decode('utf-8')
+        if isinstance(buddy_name, bytes):
+            buddy_name = buddy_name.decode('utf-8')
         
         if ideal_friend and buddy_name: 
             buddy_name = buddy_name or "Buddy"
@@ -161,6 +189,8 @@ def get_chat_history(user_id: str):
         "history": history
     }
 
+# --- SQLModel Classes (No Change) ---
+
 class User(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     username: str = Field(unique=True, index=True)
@@ -185,6 +215,8 @@ class ChatHistoryResponse(BaseModel):
     ideal_friend: str | None = None
     buddy_name: str | None = None
     history: list[dict]
+
+# --- FastAPI Endpoints (No Change in Logic) ---
 
 @app.on_event("startup")
 def on_startup():
