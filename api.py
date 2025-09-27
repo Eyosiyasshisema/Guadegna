@@ -1,4 +1,4 @@
-import getpass
+
 import os
 import uuid
 from jose import jwt
@@ -19,14 +19,16 @@ from langgraph.graph import START, MessagesState, StateGraph
 load_dotenv()
 
 if "LANGSMITH_API_KEY" not in os.environ:
-    os.environ["LANGSMITH_API_KEY"] = os.environ.get("LANGSMITH_API_KEY") or getpass.getpass(prompt="Enter your LangSmith API key: ")
+    if not os.getenv("LANGSMITH_API_KEY"):
+        raise EnvironmentError("LANGSMITH_API_KEY environment variable is missing. Deployment aborted.")
 
 if "LANGSMITH_PROJECT" not in os.environ:
-    langsmith_project = os.environ.get("LANGSMITH_PROJECT") or getpass.getpass(prompt='Enter your LangSmith Project Name (optional, default="default"): ')
-    os.environ["LANGSMITH_PROJECT"] = langsmith_project if langsmith_project else "default"
+    os.environ["LANGSMITH_PROJECT"] = "default"
 
 if "GOOGLE_API_KEY" not in os.environ:
-    os.environ["GOOGLE_API_KEY"] = os.environ.get("GOOGLE_API_KEY") or getpass.getpass("Enter API key for Google Gemini: ")
+    if not os.getenv("GOOGLE_API_KEY"):
+        raise EnvironmentError("GOOGLE_API_KEY environment variable is missing. Deployment aborted.")
+
 
 app = FastAPI()
 
