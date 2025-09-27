@@ -1,0 +1,12 @@
+# Environment variables file where secrets are stored
+.env
+
+# Python Virtual Environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# IDE files
+.vscode/
+.idea/
