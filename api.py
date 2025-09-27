@@ -4,6 +4,7 @@ from jose import jwt
 import redis
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
@@ -17,7 +18,6 @@ from langgraph.graph import START, MessagesState, StateGraph
 
 load_dotenv()
 
-# --- Environment Variable Checks (Critical for Deployment) ---
 if "LANGSMITH_API_KEY" not in os.environ:
     if not os.getenv("LANGSMITH_API_KEY"):
         raise EnvironmentError("LANGSMITH_API_KEY environment variable is missing. Deployment aborted.")
@@ -32,48 +32,51 @@ if "GOOGLE_API_KEY" not in os.environ:
 if "SECRET_KEY" not in os.environ:
     raise EnvironmentError("SECRET_KEY environment variable is missing. Deployment aborted.")
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise EnvironmentError("DATABASE_URL environment variable is missing. Database connection aborted.")
+
 app = FastAPI()
+
+origins = [
+    "https://guadegnabuddy.netlify.app", 
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:8000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,           
+    allow_credentials=True,          
+    allow_methods=["*"],             
+    allow_headers=["*"],             
+)
 
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token") 
 
-# ------------------------------------------------------------------
-# --- FIXED: POSTGRESQL CONNECTION (Using single DATABASE_URL) ---
-# ------------------------------------------------------------------
-
-# Get the full URL directly from the environment variable set on Render
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise EnvironmentError("DATABASE_URL environment variable is missing. Database connection aborted.")
-
-# Create the engine using the complete URL
 engine = create_engine(DATABASE_URL, echo=False)
 
 def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
-
-# ------------------------------------------------------------------
-# --- FIXED: REDIS CONNECTION (Using single REDIS_URL from Upstash) ---
-# ------------------------------------------------------------------
 
 REDIS_URL = os.getenv("REDIS_URL")
 
 redis_client = None 
 try:
     if not REDIS_URL:
-        # If the variable is missing, skip trying to connect and fall back to in-memory
         raise redis.exceptions.ConnectionError("REDIS_URL not set in environment.")
 
-    # redis.from_url() handles the full URL (host, port, user, password) automatically
     redis_client = redis.from_url(
         REDIS_URL,
         db=0,
-        decode_responses=True
+        decode_responses=True,
+        ssl=True 
     )
     redis_client.ping()
     memory = RedisSaver(redis_client=redis_client) 
@@ -82,8 +85,6 @@ except redis.exceptions.ConnectionError as e:
     print("Falling back to in-memory storage. Chat history will not persist.")
     from langgraph.checkpoint.memory import MemorySaver
     memory = MemorySaver()
-
-# --- Authentication Functions (No Change) ---
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -128,7 +129,6 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token")
     return user_id
 
-# --- Redis Chat Context Functions (No Change) ---
 
 def save_initial_chat_context(user_id: str, ideal_friend: str, buddy_name: str):
     """Saves the user's defined ideal friend characteristics and name to Redis."""
@@ -153,7 +153,6 @@ def get_chat_history(user_id: str):
         ideal_friend = context_data.get(b"ideal_friend")
         buddy_name = context_data.get(b"buddy_name")
         
-        # Decode bytes if necessary
         if isinstance(ideal_friend, bytes):
             ideal_friend = ideal_friend.decode('utf-8')
         if isinstance(buddy_name, bytes):
@@ -189,7 +188,6 @@ def get_chat_history(user_id: str):
         "history": history
     }
 
-# --- SQLModel Classes (No Change) ---
 
 class User(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -216,8 +214,6 @@ class ChatHistoryResponse(BaseModel):
     buddy_name: str | None = None
     history: list[dict]
 
-# --- FastAPI Endpoints (No Change in Logic) ---
-
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
@@ -227,12 +223,11 @@ def on_startup():
 def read_root():
     return {"message": "Welcome to the Buddy API! Access /docs for documentation."}
 
-
 @app.get("/users")
 def list_users(current_user: str = Depends(get_current_user)):
     return {"message": "List of users (Placeholder)", "current_user_id": current_user}
 
-@app.post("/signup", response_model=Token)
+@app.post("/api/signup", response_model=Token)
 def signup(user_data: UserCreate):
     with Session(engine) as session:
         statement = select(User).where(User.email == user_data.email)
@@ -256,7 +251,7 @@ def signup(user_data: UserCreate):
         )
         return {"access_token": access_token, "token_type": "bearer"}
 
-@app.post("/login", response_model=Token)
+@app.post("/api/login", response_model=Token)
 def login(user_data: UserCreate):
     with Session(engine) as session:
         statement = select(User).where(User.email == user_data.email)
@@ -290,7 +285,7 @@ def logout(request: Request, user_id: str = Depends(get_current_user)):
         return {"message": "Logout successful (Token revoked)"}
     else:
         return {"message": "Logout successful (Server-side revocation skipped)"}
-    
+        
 @app.get("/api/history", response_model=ChatHistoryResponse)
 async def get_history_endpoint(user_id: str = Depends(get_current_user)):
     """Fetches the conversation history and the ideal friend context from the checkpoint."""
@@ -307,6 +302,7 @@ async def get_history_endpoint(user_id: str = Depends(get_current_user)):
         status_code=status.HTTP_404_NOT_FOUND, 
         detail="Buddy personality not configured for this user."
     )
+    
 def create_prompt_template(ideal_friend: str):
     return ChatPromptTemplate.from_messages(
         [
@@ -320,7 +316,7 @@ def create_prompt_template(ideal_friend: str):
 
 model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
     
-@app.post("/chat")
+@app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current_user)):
     user_message = request.message
     stored_context = get_chat_history(user_id)
