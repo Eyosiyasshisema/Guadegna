@@ -66,7 +66,6 @@ def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
 REDIS_URL = os.getenv("REDIS_URL")
-
 redis_client = None 
 try:
     if not REDIS_URL:
@@ -247,8 +246,8 @@ class Token(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    ideal_friend: str
-    buddy_name: str 
+    ideal_friend: str | None = None
+    buddy_name: str | None = None 
 
 class ChatHistoryResponse(BaseModel):
     ideal_friend: str | None = None
@@ -363,16 +362,13 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
     stored_context = get_chat_history(user_id) 
     stored_ideal_friend = stored_context.get('ideal_friend')
     stored_buddy_name = stored_context.get('buddy_name')
-    
     current_ideal_friend = stored_ideal_friend if stored_ideal_friend else request.ideal_friend
     current_buddy_name = stored_buddy_name if stored_buddy_name else request.buddy_name
-
     if not stored_ideal_friend:
         if not request.ideal_friend or not request.buddy_name:
              raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) and name are required for first chat call.")
 
         save_initial_chat_context(user_id, current_ideal_friend, current_buddy_name)
-    
     if not current_ideal_friend:
         raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) is required.")
 
