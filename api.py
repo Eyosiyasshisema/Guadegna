@@ -88,7 +88,10 @@ except redis.exceptions.ConnectionError as e:
     memory = MemorySaver()
 
 def get_disposable_redis_client():
-    """Creates a new, short-lived Redis client instance."""
+    """
+    Creates a new, short-lived Redis client instance. 
+    Crucial for reliably checking blacklist/auth status against services like Upstash.
+    """
     if not REDIS_URL:
         raise redis.exceptions.ConnectionError("REDIS_URL not set for disposable client.")
         
@@ -133,7 +136,7 @@ def add_to_token_blacklist(token: str, expiration: datetime):
 def is_token_blacklisted(token: str):
     """
     Checks if a token is blacklisted using a disposable client. 
-    This is the CRITICAL change to fix ConnectionError in auth flow.
+    This addresses the CRITICAL ConnectionError during auth flow.
     """
     if not REDIS_URL:
         return False 
@@ -246,8 +249,8 @@ class Token(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    ideal_friend: str | None = None
-    buddy_name: str | None = None 
+    ideal_friend: str 
+    buddy_name: str 
 
 class ChatHistoryResponse(BaseModel):
     ideal_friend: str | None = None
@@ -328,16 +331,17 @@ def logout(request: Request, user_id: str = Depends(get_current_user)):
         
 @app.get("/api/history", response_model=ChatHistoryResponse)
 async def get_history_endpoint(user_id: str = Depends(get_current_user)):
-    """Fetches the conversation history and the ideal friend context from the checkpoint."""
+    """
+    Fetches the conversation history and the ideal friend context.
+    This is the key API call the frontend uses after login to decide the destination.
+    """
     history_data = get_chat_history(user_id)
-    
     if history_data['ideal_friend'] and history_data['buddy_name']:
         return {
             "ideal_friend": history_data['ideal_friend'],
             "buddy_name": history_data['buddy_name'], 
             "history": history_data['history']
         }
-    
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND, 
         detail="Buddy personality not configured for this user."
@@ -362,16 +366,17 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
     stored_context = get_chat_history(user_id) 
     stored_ideal_friend = stored_context.get('ideal_friend')
     stored_buddy_name = stored_context.get('buddy_name')
-    current_ideal_friend = stored_ideal_friend if stored_ideal_friend else request.ideal_friend
-    current_buddy_name = stored_buddy_name if stored_buddy_name else request.buddy_name
+    
+    current_ideal_friend = stored_ideal_friend
+    current_buddy_name = stored_buddy_name
     if not stored_ideal_friend:
         if not request.ideal_friend or not request.buddy_name:
              raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) and name are required for first chat call.")
-
+        current_ideal_friend = request.ideal_friend
+        current_buddy_name = request.buddy_name
         save_initial_chat_context(user_id, current_ideal_friend, current_buddy_name)
     if not current_ideal_friend:
         raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) is required.")
-
     prompt_template = create_prompt_template(current_ideal_friend)
     
     workflow = StateGraph(state_schema=MessagesState)
