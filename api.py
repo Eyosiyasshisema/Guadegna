@@ -47,10 +47,10 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,           
-    allow_credentials=True,          
-    allow_methods=["*"],             
-    allow_headers=["*"],             
+    allow_origins=origins,            
+    allow_credentials=True,           
+    allow_methods=["*"],              
+    allow_headers=["*"],              
 )
 
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -71,7 +71,6 @@ redis_client = None
 try:
     if not REDIS_URL:
         raise redis.exceptions.ConnectionError("REDIS_URL not set in environment.")
-
     redis_client = redis.from_url(
         REDIS_URL,
         db=0,
@@ -88,6 +87,20 @@ except redis.exceptions.ConnectionError as e:
     print("Falling back to in-memory storage. Chat history will not persist.")
     from langgraph.checkpoint.memory import MemorySaver
     memory = MemorySaver()
+
+def get_disposable_redis_client():
+    """Creates a new, short-lived Redis client instance."""
+    if not REDIS_URL:
+        raise redis.exceptions.ConnectionError("REDIS_URL not set for disposable client.")
+        
+    return redis.from_url(
+        REDIS_URL, 
+        db=0, 
+        decode_responses=True, 
+        socket_timeout=10,
+        max_connections=1 
+    )
+
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -107,17 +120,35 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
 
 def add_to_token_blacklist(token: str, expiration: datetime):
     if redis_client:
-        now = datetime.now(timezone.utc)
-        time_to_expire = int((expiration - now).total_seconds())
-        if time_to_expire > 0:
-            redis_client.set(f"blacklist:{token}", "revoked", ex=time_to_expire)
-            return True
+        try:
+            now = datetime.now(timezone.utc)
+            time_to_expire = int((expiration - now).total_seconds())
+            if time_to_expire > 0:
+                redis_client.set(f"blacklist:{token}", "revoked", ex=time_to_expire)
+                return True
+        except redis.exceptions.ConnectionError as e:
+            print(f"Warning: Failed to blacklist token using global client: {e}")
+            return False
     return False
 
 def is_token_blacklisted(token: str):
-    if redis_client:
-        return redis_client.get(f"blacklist:{token}") is not None
-    return False
+    """
+    Checks if a token is blacklisted using a disposable client. 
+    This is the CRITICAL change to fix ConnectionError in auth flow.
+    """
+    if not REDIS_URL:
+        return False 
+        
+    try:
+        r = get_disposable_redis_client() 
+        return r.get(f"blacklist:{token}") is not None
+    except redis.exceptions.ConnectionError as e:
+        print(f"CRITICAL REDIS FAILURE in is_token_blacklisted: {e}")
+        return False 
+    except Exception as e:
+        print(f"Unexpected error in is_token_blacklisted: {e}")
+        return False
+
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     if is_token_blacklisted(token):
@@ -136,11 +167,14 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 def save_initial_chat_context(user_id: str, ideal_friend: str, buddy_name: str):
     """Saves the user's defined ideal friend characteristics and name to Redis."""
     if redis_client:
-        context_data = {
-            "ideal_friend": ideal_friend,
-            "buddy_name": buddy_name
-        }
-        redis_client.hmset(f"context:{user_id}", context_data) 
+        try:
+            context_data = {
+                "ideal_friend": ideal_friend,
+                "buddy_name": buddy_name
+            }
+            redis_client.hmset(f"context:{user_id}", context_data) 
+        except redis.exceptions.ConnectionError as e:
+            print(f"Warning: Failed to save chat context using global client: {e}")
     else:
         print("Warning: Cannot save chat context. Redis client not available.")
 
@@ -152,38 +186,42 @@ def get_chat_history(user_id: str):
     context_data = {}
 
     if redis_client:
-        context_data = redis_client.hgetall(f"context:{user_id}")
-        ideal_friend = context_data.get(b"ideal_friend")
-        buddy_name = context_data.get(b"buddy_name")
-        
-        if isinstance(ideal_friend, bytes):
-            ideal_friend = ideal_friend.decode('utf-8')
-        if isinstance(buddy_name, bytes):
-            buddy_name = buddy_name.decode('utf-8')
-        
-        if ideal_friend and buddy_name: 
-            buddy_name = buddy_name or "Buddy"
-            config = {"configurable": {"thread_id": user_id}}
-            try:
-                raw_state = memory.get(config) 
-                messages_channel = raw_state.get('channel_values') if raw_state else None
-                
-                if messages_channel and messages_channel.get('messages'):
-                    messages = messages_channel['messages']
-                    for msg in messages:
-                        if isinstance(msg, SystemMessage):
-                            continue 
+        try:
+            context_data = redis_client.hgetall(f"context:{user_id}")
+            
+            ideal_friend = context_data.get(b"ideal_friend")
+            buddy_name = context_data.get(b"buddy_name")
+            
+            if isinstance(ideal_friend, bytes):
+                ideal_friend = ideal_friend.decode('utf-8')
+            if isinstance(buddy_name, bytes):
+                buddy_name = buddy_name.decode('utf-8')
+            
+            if ideal_friend and buddy_name: 
+                buddy_name = buddy_name or "Buddy"
+                config = {"configurable": {"thread_id": user_id}}
+                try:
+                    raw_state = memory.get(config) 
+                    messages_channel = raw_state.get('channel_values') if raw_state else None
+                    
+                    if messages_channel and messages_channel.get('messages'):
+                        messages = messages_channel['messages']
+                        for msg in messages:
+                            if isinstance(msg, SystemMessage):
+                                continue 
 
-                        sender_type = 'human'
-                        if isinstance(msg, AIMessage):
-                            sender_type = 'ai'
+                            sender_type = 'human'
+                            if isinstance(msg, AIMessage):
+                                sender_type = 'ai'
 
-                        history.append({
-                            "sender": sender_type,
-                            "content": msg.content
-                        })
-            except Exception as e:
-                print(f"Warning: Failed to retrieve LangGraph history for user {user_id}: {e}")
+                            history.append({
+                                "sender": sender_type,
+                                "content": msg.content
+                            })
+                except Exception as e:
+                    print(f"Warning: Failed to retrieve LangGraph history for user {user_id}: {e}")
+        except redis.exceptions.ConnectionError as e:
+            print(f"Warning: Failed to retrieve chat context using global client: {e}")
 
     return {
         "ideal_friend": ideal_friend,
@@ -322,7 +360,7 @@ model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current_user)):
     user_message = request.message
-    stored_context = get_chat_history(user_id)
+    stored_context = get_chat_history(user_id) 
     stored_ideal_friend = stored_context.get('ideal_friend')
     stored_buddy_name = stored_context.get('buddy_name')
     
