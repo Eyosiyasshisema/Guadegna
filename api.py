@@ -90,7 +90,7 @@ except redis.exceptions.ConnectionError as e:
 def get_disposable_redis_client():
     """
     Creates a new, short-lived Redis client instance. 
-    Crucial for reliably checking blacklist/auth status against services like Upstash.
+    Crucial for reliably checking blacklist/auth status and reading non-LangGraph context.
     """
     if not REDIS_URL:
         raise redis.exceptions.ConnectionError("REDIS_URL not set for disposable client.")
@@ -135,8 +135,7 @@ def add_to_token_blacklist(token: str, expiration: datetime):
 
 def is_token_blacklisted(token: str):
     """
-    Checks if a token is blacklisted using a disposable client. 
-    This addresses the CRITICAL ConnectionError during auth flow.
+    Checks if a token is blacklisted using a disposable client for high reliability.
     """
     if not REDIS_URL:
         return False 
@@ -167,7 +166,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 
 
 def save_initial_chat_context(user_id: str, ideal_friend: str, buddy_name: str):
-    """Saves the user's defined ideal friend characteristics and name to Redis."""
+    """Saves the user's defined ideal friend characteristics and name to Redis (uses global client)."""
     if redis_client:
         try:
             context_data = {
@@ -181,49 +180,55 @@ def save_initial_chat_context(user_id: str, ideal_friend: str, buddy_name: str):
         print("Warning: Cannot save chat context. Redis client not available.")
 
 def get_chat_history(user_id: str):
-    """Retrieves chat history and ideal friend characteristics from Redis/LangGraph."""
+    """
+    Retrieves chat history and ideal friend characteristics from Redis/LangGraph.
+    Uses disposable client for critical initial context retrieval.
+    """
     history = []
     ideal_friend = None
     buddy_name = None
     context_data = {}
-
-    if redis_client:
+    try:
+        r = get_disposable_redis_client()
+        context_data = r.hgetall(f"context:{user_id}")
+        
+        ideal_friend = context_data.get(b"ideal_friend")
+        buddy_name = context_data.get(b"buddy_name")
+        
+        if isinstance(ideal_friend, bytes):
+            ideal_friend = ideal_friend.decode('utf-8')
+        if isinstance(buddy_name, bytes):
+            buddy_name = buddy_name.decode('utf-8')
+            
+    except redis.exceptions.ConnectionError as e:
+        print(f"CRITICAL REDIS FAILURE in get_chat_history (disposable client): {e}")
+        pass
+    except Exception as e:
+        print(f"Unexpected error in get_chat_history: {e}")
+        pass
+    if ideal_friend and buddy_name and redis_client: 
+        buddy_name = buddy_name or "Buddy"
+        config = {"configurable": {"thread_id": user_id}}
         try:
-            context_data = redis_client.hgetall(f"context:{user_id}")
+            raw_state = memory.get(config) 
+            messages_channel = raw_state.get('channel_values') if raw_state else None
             
-            ideal_friend = context_data.get(b"ideal_friend")
-            buddy_name = context_data.get(b"buddy_name")
-            
-            if isinstance(ideal_friend, bytes):
-                ideal_friend = ideal_friend.decode('utf-8')
-            if isinstance(buddy_name, bytes):
-                buddy_name = buddy_name.decode('utf-8')
-            
-            if ideal_friend and buddy_name: 
-                buddy_name = buddy_name or "Buddy"
-                config = {"configurable": {"thread_id": user_id}}
-                try:
-                    raw_state = memory.get(config) 
-                    messages_channel = raw_state.get('channel_values') if raw_state else None
-                    
-                    if messages_channel and messages_channel.get('messages'):
-                        messages = messages_channel['messages']
-                        for msg in messages:
-                            if isinstance(msg, SystemMessage):
-                                continue 
+            if messages_channel and messages_channel.get('messages'):
+                messages = messages_channel['messages']
+                for msg in messages:
+                    if isinstance(msg, SystemMessage):
+                        continue 
 
-                            sender_type = 'human'
-                            if isinstance(msg, AIMessage):
-                                sender_type = 'ai'
+                    sender_type = 'human'
+                    if isinstance(msg, AIMessage):
+                        sender_type = 'ai'
 
-                            history.append({
-                                "sender": sender_type,
-                                "content": msg.content
-                            })
-                except Exception as e:
-                    print(f"Warning: Failed to retrieve LangGraph history for user {user_id}: {e}")
-        except redis.exceptions.ConnectionError as e:
-            print(f"Warning: Failed to retrieve chat context using global client: {e}")
+                    history.append({
+                        "sender": sender_type,
+                        "content": msg.content
+                    })
+        except Exception as e:
+            print(f"Warning: Failed to retrieve LangGraph history for user {user_id}: {e}")
 
     return {
         "ideal_friend": ideal_friend,
@@ -333,15 +338,17 @@ def logout(request: Request, user_id: str = Depends(get_current_user)):
 async def get_history_endpoint(user_id: str = Depends(get_current_user)):
     """
     Fetches the conversation history and the ideal friend context.
-    This is the key API call the frontend uses after login to decide the destination.
+    Frontend uses the response status (200 vs 404) to decide navigation.
     """
     history_data = get_chat_history(user_id)
+    
     if history_data['ideal_friend'] and history_data['buddy_name']:
         return {
             "ideal_friend": history_data['ideal_friend'],
             "buddy_name": history_data['buddy_name'], 
             "history": history_data['history']
         }
+
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND, 
         detail="Buddy personality not configured for this user."
@@ -374,7 +381,9 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
              raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) and name are required for first chat call.")
         current_ideal_friend = request.ideal_friend
         current_buddy_name = request.buddy_name
+     
         save_initial_chat_context(user_id, current_ideal_friend, current_buddy_name)
+
     if not current_ideal_friend:
         raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) is required.")
     prompt_template = create_prompt_template(current_ideal_friend)
