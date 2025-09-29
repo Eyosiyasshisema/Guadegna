@@ -66,6 +66,7 @@ def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
 REDIS_URL = os.getenv("REDIS_URL")
+
 redis_client = None 
 try:
     if not REDIS_URL:
@@ -89,15 +90,16 @@ except redis.exceptions.ConnectionError as e:
 
 def get_disposable_redis_client():
     """
-    Creates a new, short-lived Redis client instance for highly critical, 
-    low-volume reads (like auth/history check).
+    Creates a new, short-lived Redis client instance for critical reads.
+    decode_responses=False ensures we get raw bytes to manually decode.
     """
     if not REDIS_URL:
         return None
+        
     return redis.from_url(
         REDIS_URL, 
         db=0, 
-        decode_responses=True, 
+        decode_responses=False, 
         socket_timeout=5, 
         socket_connect_timeout=5,
         max_connections=1 
@@ -142,7 +144,8 @@ def is_token_blacklisted(token: str):
         return False
         
     try:
-        return r.get(f"blacklist:{token}") is not None
+        r.ping() 
+        return r.get(f"blacklist:{token}".encode('utf-8')) is not None
     except redis.exceptions.ConnectionError as e:
         print(f"CRITICAL REDIS FAILURE in is_token_blacklisted: {e}")
         return False 
@@ -191,15 +194,15 @@ def get_chat_history(user_id: str):
     if r:
         try:
             r.ping() 
-            context_data = r.hgetall(f"context:{user_id}")
+            context_data = r.hgetall(f"context:{user_id}".encode('utf-8'))
             
-            ideal_friend = context_data.get(b"ideal_friend")
-            buddy_name = context_data.get(b"buddy_name")
+            ideal_friend_bytes = context_data.get(b"ideal_friend")
+            buddy_name_bytes = context_data.get(b"buddy_name")
             
-            if isinstance(ideal_friend, bytes):
-                ideal_friend = ideal_friend.decode('utf-8')
-            if isinstance(buddy_name, bytes):
-                buddy_name = buddy_name.decode('utf-8')
+            if ideal_friend_bytes:
+                ideal_friend = ideal_friend_bytes.decode('utf-8')
+            if buddy_name_bytes:
+                buddy_name = buddy_name_bytes.decode('utf-8')
                 
         except redis.exceptions.ConnectionError as e:
             print(f"CRITICAL REDIS FAILURE in get_chat_history (disposable client): {e}")
@@ -251,9 +254,10 @@ class UserCreate(BaseModel):
     email: str
     password: str
 
-class Token(BaseModel):
+class LoginResponse(BaseModel):
     access_token: str
     token_type: str
+    has_buddy: bool = False 
 
 class ChatRequest(BaseModel):
     message: str
@@ -278,7 +282,7 @@ def read_root():
 def list_users(current_user: str = Depends(get_current_user)):
     return {"message": "List of users (Placeholder)", "current_user_id": current_user}
 
-@app.post("/api/signup", response_model=Token)
+@app.post("/api/signup", response_model=LoginResponse)
 def signup(user_data: UserCreate):
     with Session(engine) as session:
         statement = select(User).where(User.email == user_data.email)
@@ -300,9 +304,9 @@ def signup(user_data: UserCreate):
         access_token = create_access_token(
             data={"sub": str(new_user.id)}, expires_delta=access_token_expires
         )
-        return {"access_token": access_token, "token_type": "bearer"}
-
-@app.post("/api/login", response_model=Token)
+        return {"access_token": access_token, "token_type": "bearer", "has_buddy": False}
+    
+@app.post("/api/login", response_model=LoginResponse)
 def login(user_data: UserCreate):
     with Session(engine) as session:
         statement = select(User).where(User.email == user_data.email)
@@ -314,7 +318,17 @@ def login(user_data: UserCreate):
         access_token = create_access_token(
             data={"sub": str(user.id)}, expires_delta=access_token_expires
         )
-        return {"access_token": access_token, "token_type": "bearer"}
+    try:
+        context = get_chat_history(str(user.id))
+        has_buddy = bool(context['ideal_friend'] and context['buddy_name'])
+    except Exception as e:
+        print(f"Warning: Failed to check buddy context during login: {e}")
+        has_buddy = False 
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer", 
+        "has_buddy": has_buddy
+    }
 
 @app.post("/api/logout")
 def logout(request: Request, user_id: str = Depends(get_current_user)):
@@ -341,17 +355,16 @@ def logout(request: Request, user_id: str = Depends(get_current_user)):
 async def get_history_endpoint(user_id: str = Depends(get_current_user)):
     """
     Fetches the conversation history and the ideal friend context.
-    Frontend uses the response status (200 vs 404) to decide navigation.
+    This endpoint is still necessary for the frontend to load *data* for the chat page.
     """
     history_data = get_chat_history(user_id)
-
+   
     if history_data['ideal_friend'] and history_data['buddy_name']:
         return {
             "ideal_friend": history_data['ideal_friend'],
             "buddy_name": history_data['buddy_name'], 
             "history": history_data['history']
         }
-    
     raise HTTPException(
         status_code=status.HTTP_404_NOT_FOUND, 
         detail="Buddy personality not configured for this user."
@@ -373,18 +386,23 @@ model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current_user)):
     user_message = request.message
+    
     stored_context = get_chat_history(user_id) 
     stored_ideal_friend = stored_context.get('ideal_friend')
     stored_buddy_name = stored_context.get('buddy_name')
     
     current_ideal_friend = stored_ideal_friend
     current_buddy_name = stored_buddy_name
+
     if not stored_ideal_friend:
         if not request.ideal_friend or not request.buddy_name:
              raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) and name are required for first chat call.")
+
         current_ideal_friend = request.ideal_friend
         current_buddy_name = request.buddy_name
+        
         save_initial_chat_context(user_id, current_ideal_friend, current_buddy_name)
+    
     if not current_ideal_friend:
         raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) is required.")
     prompt_template = create_prompt_template(current_ideal_friend)
