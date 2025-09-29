@@ -95,7 +95,7 @@ python-jose==3.5.0
 python-multipart==0.0.20
 python-ulid==3.1.0
 PyYAML==6.0.2
-redis==5.0.1 
+redis==6.4.0  
 redisvl==0.8.2
 regex==2025.7.34
 requests==2.32.5
