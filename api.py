@@ -76,8 +76,10 @@ try:
         REDIS_URL,
         db=0,
         decode_responses=True,
-        health_check_interval=30, 
-        retry_on_timeout=True  
+        health_check_interval=15, 
+        retry_on_timeout=True ,
+        socket_timeout=10, 
+        max_connections=50  
     )
     redis_client.ping()
     memory = RedisSaver(redis_client=redis_client) 
