@@ -70,11 +70,14 @@ def create_db_and_tables():
 REDIS_URL = os.getenv("REDIS_URL")
 
 # --- START OF FIX: Robust Redis/LangGraph Checkpointer Initialization ---
+# --- START OF REVISED FIX: Robust Redis/LangGraph Checkpointer Initialization ---
 redis_client = None 
+memory = None
+
 try:
     if not REDIS_URL:
-        # Raise a general exception if URL is missing, to trigger the generic fallback path
-        raise Exception("REDIS_URL not set in environment.") 
+        # If URL is missing, skip the try block entirely.
+        raise ValueError("REDIS_URL not set in environment. Skipping RedisSaver.")
     
     # 1. ATTEMPT CONNECTION
     temp_redis_client = redis.from_url(
@@ -89,29 +92,38 @@ try:
     temp_redis_client.ping() # Check connection availability
 
     # 2. ATTEMPT CHECKPOINTER SETUP (This is where 'MODULE' fails)
-    # The RedisSaver initialization calls redisvl which attempts MODULE LIST
-    memory = RedisSaver(redis_client=temp_redis_client) 
+    # The RedisSaver initialization is the potential failure point.
+    memory_saver_instance = RedisSaver(redis_client=temp_redis_client) 
     
-    # If both succeed, set the global client
+    # If successful, assign to globals
     redis_client = temp_redis_client
-    
+    memory = memory_saver_instance
+    print("INFO: Successfully configured RedisSaver.")
+
 except Exception as e: 
-    # 3. HANDLE FAILURE
-    # Check for ConnectionError, the specific 'MODULE' error string, or the RedisVLError class name
-    is_redis_incompatible = isinstance(e, redis.exceptions.ConnectionError) or ("MODULE" in str(e) or "index_name" in str(e) or "RedisVLError" in type(e).__name__)
+    # 3. HANDLE FAILURE (Any exception during setup, including 'MODULE' errors)
+    is_incompatible = isinstance(e, redis.exceptions.ConnectionError) or ("MODULE" in str(e) or "RedisVLError" in type(e).__name__)
     
-    if is_redis_incompatible or "REDIS_URL not set" in str(e):
-        # Crucially, force the global client to None if it fails.
+    if is_incompatible or isinstance(e, ValueError):
+        # Force Redis client to None to disable all other Redis functions (e.g., blacklist)
         redis_client = None 
-        # MemorySaver is now imported at the top
+        
+        # Fallback to MemorySaver
+        # We must import this here again, just in case, for safety, although it should be imported at the top.
+        from langgraph.checkpoint.memory import MemorySaver 
         memory = MemorySaver()
-        print("INFO: Redis connection failed or is incompatible ('MODULE' command blocked). Falling back to in-memory chat history (MemorySaver).")
+        print(f"INFO: Redis initialization failed due to incompatibility or connection error: {str(e)}. Falling back to in-memory chat history (MemorySaver).")
     else:
-        # Re-raise for unknown/unhandled critical exceptions
+        # Re-raise for unknown critical exceptions (e.g., config file access errors)
         raise e
-# --- END OF FIX ---
 
+# Ensure memory is set to MemorySaver even if REDIS_URL was missing (for safety)
+if memory is None:
+    from langgraph.checkpoint.memory import MemorySaver 
+    memory = MemorySaver()
+    print("INFO: REDIS_URL was not set. Defaulting to in-memory chat history (MemorySaver).")
 
+# --- END OF REVISED FIX ---
 def get_disposable_redis_client():
     """
     Creates a new, short-lived Redis client instance for critical reads.
