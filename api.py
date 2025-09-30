@@ -66,24 +66,38 @@ def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
 REDIS_URL = os.getenv("REDIS_URL")
+REDIS_URL = os.getenv("REDIS_URL")
 
 redis_client = None 
 try:
     if not REDIS_URL:
         raise redis.exceptions.ConnectionError("REDIS_URL not set in environment.")
-    redis_client = redis.from_url(
+    
+    # 1. ATTEMPT CONNECTION
+    temp_redis_client = redis.from_url(
         REDIS_URL,
         db=0,
         decode_responses=False, 
         health_check_interval=15, 
-        retry_on_timeout=True ,
+        retry_on_timeout=True,
         socket_timeout=10, 
         max_connections=50 
     )
-    redis_client.ping()
-    memory = RedisSaver(redis_client=redis_client) 
+    temp_redis_client.ping() # Check connection availability
+
+    # 2. ATTEMPT CHECKPOINTER SETUP (This is where 'MODULE' fails)
+    memory = RedisSaver(redis_client=temp_redis_client) 
+    
+    # If both succeed, set the global client
+    redis_client = temp_redis_client
+    
 except Exception as e: 
-    if isinstance(e, redis.exceptions.ConnectionError) or ("MODULE" in str(e) or "index_name" in str(e)):
+    # 3. HANDLE FAILURE
+    is_redis_incompatible = isinstance(e, redis.exceptions.ConnectionError) or ("MODULE" in str(e) or "index_name" in str(e) or "RedisVLError" in type(e).__name__)
+    
+    if is_redis_incompatible:
+        # Crucially, force the global client to None if it fails.
+        redis_client = None 
         from langgraph.checkpoint.memory import MemorySaver
         memory = MemorySaver()
     else:
