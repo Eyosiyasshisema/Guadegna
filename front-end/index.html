@@ -210,7 +210,10 @@
         const showSignupBtn = document.getElementById('show-signup');
         const backToAuthLoginBtn = document.getElementById('back-to-auth-login');
         const backToAuthSignupBtn = document.getElementById('back-to-auth-signup');
+        // NOTE: The back button from personality section should go to auth, not login, unless explicitly logged out.
+        // I'll keep it going to login for now, but usually it goes to auth.
         const backToLoginPersonalityBtn = document.getElementById('back-to-login-personality');
+        // The back button from chat should go to the personality section to update the buddy's characteristics.
         const backToPersonalityChatBtn = document.getElementById('back-to-personality-chat'); 
 
         const logoutButton = document.getElementById('logout-button');
@@ -241,10 +244,11 @@
             chatSection.classList.add('hidden');
             
             if (section === loginSection || section === signupSection || section === personalitySection) {
-                buddyNameInput.value = '';
-                personalityInput.value = '';
+                // Clear inputs specific to these flow
+                // No need to clear chat/buddyName/etc. here, only during logout/session start
             }
             if (section === authSection) {
+                // Clear auth forms when returning to main auth screen
                 loginEmailInput.value = '';
                 loginPasswordInput.value = '';
                 document.getElementById('signup-username').value = '';
@@ -254,18 +258,32 @@
             
             section.classList.remove('hidden');
             section.classList.add('animate-fadeIn');
+            
+            // Scroll chat to bottom if showing the chat section
+            if (section === chatSection) {
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
         }
 
         showLoginBtn.addEventListener('click', () => showSection(loginSection));
         showSignupBtn.addEventListener('click', () => showSection(signupSection));
         backToAuthLoginBtn.addEventListener('click', () => showSection(authSection));
         backToAuthSignupBtn.addEventListener('click', () => showSection(authSection));
+        
+        // This is a crucial design point: going back from personality should typically mean returning to login/signup.
         backToLoginPersonalityBtn.addEventListener('click', () => {
-            accessToken = null;
-            showSection(loginSection); 
+             // For a smoother flow, let's keep the user logged in if they arrived from login
+             showSection(loginSection); 
         });
+        
         logoutButton.addEventListener('click', handleLogout);
-        backToPersonalityChatBtn.addEventListener('click', handleReturnToChat);
+        
+        // When going back from chat, we show the personality section with the current settings.
+        backToPersonalityChatBtn.addEventListener('click', () => {
+            buddyNameInput.value = buddyName;
+            personalityInput.value = idealFriendCharacteristics;
+            showSection(personalitySection);
+        });
 
         signupForm.addEventListener('submit', async function(event) {
             event.preventDefault();
@@ -284,6 +302,7 @@
 
                 if (response.ok) {
                     accessToken = data.access_token;
+                    // Always show personality setup for new signups
                     showSection(personalitySection);
                 } else {
                     alert(`Signup failed: ${data.detail || 'User or email already exists.'}`);
@@ -311,7 +330,17 @@
 
                 if (response.ok) {
                     accessToken = data.access_token;
-                    await handleReturnToChat(); 
+                    
+                    // --- CRITICAL FRONTEND FIX ---
+                    if (data.has_buddy) {
+                        // If has_buddy is TRUE, call history endpoint to load data and go to chat
+                        await loadChatHistoryAndGoToChat(); 
+                    } else {
+                        // If has_buddy is FALSE (new user or Redis fail), go directly to personality setup
+                        showSection(personalitySection);
+                    }
+                    // -----------------------------
+
                 } else {
                     alert(`Login failed: ${data.detail || 'Incorrect email or password.'}`);
                 }
@@ -321,9 +350,11 @@
             }
         });
         
-        async function handleReturnToChat() {
+        // Renamed function to be more explicit about its purpose.
+        async function loadChatHistoryAndGoToChat() {
             if (!accessToken) {
-                return showSection(personalitySection); 
+                // If somehow called without token, fall back to auth screen
+                return showSection(authSection); 
             }
 
             try {
@@ -335,6 +366,7 @@
                 const data = await response.json();
                 
                 if (response.ok) {
+                    // Success: Load data and go to chat
                     buddyName = data.buddy_name || "Buddy";
                     idealFriendCharacteristics = data.ideal_friend || ""; 
                     buddyNameDisplay.textContent = buddyName;
@@ -343,16 +375,20 @@
                     if (data.history && data.history.length > 0) {
                         data.history.forEach(msg => {
                             const sender = msg.sender === 'human' ? 'You' : buddyName;
+                            // The isHistory flag prevents the "slide-in" animation for historical messages
                             appendMessage(msg.content, sender, true); 
                         });
                     } else {
-                         const initialMessage = `Welcome back, I'm ${buddyName}! Your session is ready. What's on your mind?`;
-                         appendMessage(initialMessage, buddyName);
+                        // User has buddy context but no chat history yet
+                        const initialMessage = `Welcome back, I'm ${buddyName}! Your session is ready. What's on your mind?`;
+                        appendMessage(initialMessage, buddyName);
                     }
 
                     showSection(chatSection);
 
                 } else if (response.status === 404) {
+                    // Fail: This should not happen if has_buddy was true, but as a fallback:
+                    console.warn("History endpoint returned 404 despite has_buddy=true. Forcing personality setup.");
                     buddyNameInput.value = '';
                     personalityInput.value = '';
                     buddyName = "Buddy";
@@ -360,42 +396,47 @@
                     showSection(personalitySection);
 
                 } else {
-                    console.error(`Error fetching history: ${data.detail || response.statusText}.`);
-                    showSection(personalitySection); 
+                    console.error(`Error fetching history: ${data.detail || response.statusText}. Forcing logout.`);
+                    // Severe error (e.g., 401, 500), force user to restart
+                    await handleLogout(); 
                 }
 
             } catch (error) {
                 console.error('Error loading chat history (network or parsing failure):', error);
-                showSection(personalitySection); 
+                // Assume network issue, show a fallback message
+                alert("Could not load chat history. Please try again.");
+                showSection(loginSection); 
             }
         }
         
         async function handleLogout() {
             if (!accessToken) {
                 console.log("No token found. Client-side logout complete.");
-                showSection(authSection);
-                return;
-            }
-            try {
-                const response = await fetch(`${API_BASE_URL}/logout`, {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${accessToken}` },
-                });
+                // Proceed to cleanup below
+            } else {
+                try {
+                    const response = await fetch(`${API_BASE_URL}/logout`, {
+                        method: 'POST',
+                        headers: { 'Authorization': `Bearer ${accessToken}` },
+                    });
 
-                if (response.ok) {
-                    console.log('Server-side token revocation successful.');
+                    if (response.ok) {
+                        console.log('Server-side token revocation successful.');
+                    }
+                    
+                } catch (error) {
+                    // Handle network error during logout gracefully
+                    console.error('Error during server-side logout, proceeding with client-side cleanup:', error);
                 }
-                
-            } catch (error) {
-                console.error('Error during server-side logout, proceeding with client-side cleanup:', error);
-            } finally {
-                accessToken = null;
-                buddyName = "Buddy";
-                idealFriendCharacteristics = "";
-                chatContainer.innerHTML = '';
-                showSection(authSection);
-                alert('You have been logged out.');
             }
+            
+            // Client-side cleanup regardless of server response
+            accessToken = null;
+            buddyName = "Buddy";
+            idealFriendCharacteristics = "";
+            chatContainer.innerHTML = '';
+            showSection(authSection);
+            alert('You have been logged out.');
         }
 
         personalityForm.addEventListener('submit', async function(event) {
@@ -408,9 +449,15 @@
                 return;
             }
             
-            chatContainer.innerHTML = '';
+            // Reset border color
+            personalityInput.style.borderColor = ''; 
+            
+            // Save local variables
             buddyName = name;
             buddyNameDisplay.textContent = buddyName;
+            
+            // Go to chat (The chatForm handler will perform the *initial* POST /api/chat which saves the context)
+            chatContainer.innerHTML = '';
             showSection(chatSection);
         
             const initialMessage = `Alright, ${buddyName} here! Based on the personality you described, I'm ready to become your friend. What's on your mind?`;
@@ -430,6 +477,9 @@
                     throw new Error("Authentication token is missing. Please log in again.");
                 }
 
+                // Initial chat sends the full personality, subsequent chats rely on stored context.
+                const isInitialChat = idealFriendCharacteristics !== ''; 
+
                 const response = await fetch(`${API_BASE_URL}/chat`, {
                     method: 'POST',
                     headers: {
@@ -438,8 +488,9 @@
                     },
                     body: JSON.stringify({
                         message: userMessage,
-                        ideal_friend: idealFriendCharacteristics , 
-                        buddy_name: buddyName
+                        // Send context only if it's the first message after setting personality
+                        ideal_friend: isInitialChat ? idealFriendCharacteristics : null, 
+                        buddy_name: isInitialChat ? buddyName : null
                     }),
                 });
                 
@@ -451,6 +502,14 @@
                 }
 
                 appendMessage(data.response, buddyName);
+                
+                // CRITICAL: Clear the local context variables after the first successful chat.
+                // This ensures subsequent chats rely only on the stored Redis context, 
+                // preventing huge payloads and correctly utilizing the API logic.
+                if (isInitialChat) {
+                    idealFriendCharacteristics = null;
+                    // buddyName is preserved for display, but no longer sent in chat payload.
+                }
 
             } catch (error) {
                 console.error('Error fetching chat response:', error);
@@ -479,7 +538,6 @@
                 messageBubble.classList.add('bg-purple-600', 'text-white');
             }
             
-        
             if (!isHistory) {
                  messageBubble.classList.add('animate-fadeInRight');
             }
