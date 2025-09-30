@@ -13,7 +13,7 @@ from sqlmodel import SQLModel, Field, create_engine, Session, select
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langgraph.checkpoint.redis import RedisSaver # Kept as RedisSaver from last fix
+from langgraph.checkpoint.redis import RedisSaver
 from langgraph.graph import START, MessagesState, StateGraph
 
 load_dotenv()
@@ -47,10 +47,10 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins, 
-    allow_credentials=True, 
-    allow_methods=["*"], 
-    allow_headers=["*"], 
+    allow_origins=origins,            
+    allow_credentials=True,           
+    allow_methods=["*"],              
+    allow_headers=["*"],              
 )
 
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -67,6 +67,7 @@ def create_db_and_tables():
 
 REDIS_URL = os.getenv("REDIS_URL")
 
+
 redis_client = None 
 try:
     if not REDIS_URL:
@@ -78,12 +79,10 @@ try:
         health_check_interval=15, 
         retry_on_timeout=True ,
         socket_timeout=10, 
-        max_connections=50 
+        max_connections=50  
     )
     redis_client.ping()
-    # 💥 CRITICAL FIX: Removed 'client=' keyword. This prevents the TypeError.
-    # The 'index_name=None' still prevents the Upstash 'MODULE' command error.
-    memory = RedisSaver(redis_client, index_name=None) 
+    memory = RedisSaver(redis_client=redis_client) 
 except redis.exceptions.ConnectionError as e:
     print(f"Could not connect to Redis: {e}")
     print("Falling back to in-memory storage. Chat history will not persist.")
@@ -218,7 +217,6 @@ def get_chat_history(user_id: str):
         buddy_name = buddy_name or "Buddy"
         config = {"configurable": {"thread_id": user_id}}
         try:
-            # The 'memory' object is now the correctly configured RedisSaver
             raw_state = memory.get(config) 
             messages_channel = raw_state.get('channel_values') if raw_state else None
             
