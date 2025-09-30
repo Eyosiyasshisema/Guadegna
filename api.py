@@ -82,7 +82,7 @@ try:
         max_connections=50  
     )
     redis_client.ping()
-    memory = RedisSaver(redis_client=redis_client) 
+    memory = RedisSaver(redis_client=redis_client, index_name=None)
 except redis.exceptions.ConnectionError as e:
     print(f"Could not connect to Redis: {e}")
     print("Falling back to in-memory storage. Chat history will not persist.")
