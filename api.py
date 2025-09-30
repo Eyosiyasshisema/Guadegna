@@ -47,10 +47,10 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,            
-    allow_credentials=True,           
-    allow_methods=["*"],              
-    allow_headers=["*"],              
+    allow_origins=origins,              
+    allow_credentials=True,             
+    allow_methods=["*"],                
+    allow_headers=["*"],                
 )
 
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -78,14 +78,12 @@ try:
         health_check_interval=15, 
         retry_on_timeout=True ,
         socket_timeout=10, 
-        max_connections=50  
+        max_connections=50 
     )
     redis_client.ping()
     memory = RedisSaver(redis_client=redis_client) 
 except Exception as e: 
     if isinstance(e, redis.exceptions.ConnectionError) or ("MODULE" in str(e) or "index_name" in str(e)):
-        print(f"Could not connect to Redis or RediSearch feature unsupported: {e}")
-        print("Falling back to in-memory storage. Chat history will not persist.")
         from langgraph.checkpoint.memory import MemorySaver
         memory = MemorySaver()
     else:
@@ -134,7 +132,6 @@ def add_to_token_blacklist(token: str, expiration: datetime):
                 redis_client.set(f"blacklist:{token}".encode('utf-8'), b"revoked", ex=time_to_expire)
                 return True
         except redis.exceptions.ConnectionError as e:
-            print(f"Warning: Failed to blacklist token using global client: {e}")
             return False
     return False
 
@@ -150,10 +147,8 @@ def is_token_blacklisted(token: str):
         r.ping() 
         return r.get(f"blacklist:{token}".encode('utf-8')) is not None
     except redis.exceptions.ConnectionError as e:
-        print(f"CRITICAL REDIS FAILURE in is_token_blacklisted: {e}")
         return False 
     except Exception as e:
-        print(f"Unexpected error in is_token_blacklisted: {e}")
         return False
 
 
@@ -181,9 +176,9 @@ def save_initial_chat_context(user_id: str, ideal_friend: str, buddy_name: str):
             }
             redis_client.hmset(f"context:{user_id}".encode('utf-8'), context_data) 
         except redis.exceptions.ConnectionError as e:
-            print(f"Warning: Failed to save chat context using global client: {e}")
+            pass
     else:
-        print("Warning: Cannot save chat context. Redis client not available.")
+        pass
 
 def get_chat_history(user_id: str):
     """
@@ -207,11 +202,9 @@ def get_chat_history(user_id: str):
                 buddy_name = buddy_name_bytes.decode('utf-8')
                 
         except redis.exceptions.ConnectionError as e:
-            print(f"CRITICAL REDIS FAILURE in get_chat_history (disposable client): {e}")
             ideal_friend = None
             buddy_name = None
         except Exception as e:
-            print(f"Unexpected error in get_chat_history: {e}")
             ideal_friend = None
             buddy_name = None
             
@@ -237,7 +230,7 @@ def get_chat_history(user_id: str):
                         "content": msg.content
                     })
         except Exception as e:
-            print(f"Warning: Failed to retrieve LangGraph history for user {user_id}: {e}")
+            pass
 
     return {
         "ideal_friend": ideal_friend,
@@ -326,7 +319,6 @@ def login(user_data: UserCreate):
         context = get_chat_history(str(user.id))
         has_buddy = bool(context['ideal_friend'] and context['buddy_name'])
     except Exception as e:
-        print(f"Warning: Failed to check buddy context during login: {e}")
         has_buddy = False 
 
     return {
