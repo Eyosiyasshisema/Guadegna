@@ -67,7 +67,6 @@ def create_db_and_tables():
 
 REDIS_URL = os.getenv("REDIS_URL")
 
-
 redis_client = None 
 try:
     if not REDIS_URL:
@@ -79,15 +78,18 @@ try:
         health_check_interval=15, 
         retry_on_timeout=True ,
         socket_timeout=10, 
-        max_connections=50  
+        max_connections=50  
     )
     redis_client.ping()
-    memory = RedisSaver(redis_client=redis_client, index_name=None)
-except redis.exceptions.ConnectionError as e:
-    print(f"Could not connect to Redis: {e}")
-    print("Falling back to in-memory storage. Chat history will not persist.")
-    from langgraph.checkpoint.memory import MemorySaver
-    memory = MemorySaver()
+    memory = RedisSaver(redis_client=redis_client) 
+except Exception as e: 
+    if isinstance(e, redis.exceptions.ConnectionError) or ("MODULE" in str(e) or "index_name" in str(e)):
+        print(f"Could not connect to Redis or RediSearch feature unsupported: {e}")
+        print("Falling back to in-memory storage. Chat history will not persist.")
+        from langgraph.checkpoint.memory import MemorySaver
+        memory = MemorySaver()
+    else:
+        raise e
 
 def get_disposable_redis_client():
     """
