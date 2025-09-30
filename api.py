@@ -13,11 +13,9 @@ from sqlmodel import SQLModel, Field, create_engine, Session, select
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langgraph.checkpoint.redis import RedisSaver
-# FIX: Import MemorySaver here so it's available in the fallback
-from langgraph.checkpoint.memory import MemorySaver 
+# Removed explicit imports for RedisSaver/MemorySaver to allow conditional import later
 from langgraph.graph import START, MessagesState, StateGraph
-from typing import cast # Added for type hinting in the new graph creation function
+from typing import cast 
 
 
 load_dotenv()
@@ -71,13 +69,14 @@ def create_db_and_tables():
 
 REDIS_URL = os.getenv("REDIS_URL")
 
-# --- START OF REVISED FIX: Robust Redis/LangGraph Checkpointer Initialization (Startup Logic) ---
+# --------------------------------------------------------------------------------
+# --- START OF FINAL FIX: Conditional Checkpointer Initialization ---
 redis_client = None 
 memory = None
 
 try:
     if not REDIS_URL:
-        # If URL is missing, skip the try block entirely.
+        # If URL is missing, skip to the MemorySaver fallback.
         raise ValueError("REDIS_URL not set in environment. Skipping RedisSaver.")
     
     # 1. ATTEMPT CONNECTION
@@ -92,7 +91,8 @@ try:
     )
     temp_redis_client.ping() # Check connection availability
 
-    # 2. ATTEMPT CHECKPOINTER SETUP (This is where 'MODULE' or other connection errors fail)
+    # 2. IF SUCCESSFUL, IMPORT AND SETUP RedisSaver
+    from langgraph.checkpoint.redis import RedisSaver
     memory_saver_instance = RedisSaver(redis_client=temp_redis_client) 
     
     # If successful, assign to globals
@@ -108,7 +108,8 @@ except Exception as e:
         # Force Redis client to None to disable all other Redis functions (e.g., blacklist)
         redis_client = None 
         
-        # Fallback to MemorySaver
+        # Fallback: ONLY IMPORT MemorySaver in this branch
+        from langgraph.checkpoint.memory import MemorySaver 
         memory = MemorySaver()
         print(f"INFO: Redis initialization failed due to incompatibility or connection error: {str(e)}. Falling back to in-memory chat history (MemorySaver).")
     else:
@@ -117,10 +118,13 @@ except Exception as e:
 
 # Ensure memory is set to MemorySaver even if REDIS_URL was missing (for safety)
 if memory is None:
+    from langgraph.checkpoint.memory import MemorySaver 
     memory = MemorySaver()
     print("INFO: REDIS_URL was not set. Defaulting to in-memory chat history (MemorySaver).")
 
-# --- END OF REVISED FIX ---
+# --- END OF FINAL FIX ---
+# --------------------------------------------------------------------------------
+
 def get_disposable_redis_client():
     """
     Creates a new, short-lived Redis client instance for critical reads.
@@ -137,9 +141,6 @@ def get_disposable_redis_client():
         socket_connect_timeout=5,
         max_connections=1 
     )
-
-
-# ... rest of your file (verbatim) ...
 
 def add_to_token_blacklist(token: str, expiration: datetime):
     if redis_client:
@@ -187,34 +188,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def add_to_token_blacklist(token: str, expiration: datetime):
-    if redis_client:
-        try:
-            now = datetime.now(timezone.utc)
-            time_to_expire = int((expiration - now).total_seconds())
-            if time_to_expire > 0:
-                redis_client.set(f"blacklist:{token}".encode('utf-8'), b"revoked", ex=time_to_expire)
-                return True
-        except redis.exceptions.ConnectionError as e:
-            return False
-    return False
-
-def is_token_blacklisted(token: str):
-    """
-    Checks if a token is blacklisted using a disposable client for high reliability.
-    """
-    r = get_disposable_redis_client()
-    if not r:
-        return False
-        
-    try:
-        r.ping() 
-        return r.get(f"blacklist:{token}".encode('utf-8')) is not None
-    except redis.exceptions.ConnectionError as e:
-        return False 
-    except Exception as e:
-        return False
-
+# Redundant function definition removed for clarity, relying on the first one defined
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     if is_token_blacklisted(token):
@@ -448,7 +422,7 @@ def create_prompt_template(ideal_friend: str):
 
 model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 
-# --- NEW HELPER FUNCTION FOR GRAPH COMPILATION (ADDED) ---
+# --- NEW HELPER FUNCTION FOR GRAPH COMPILATION (ADDED in previous fix, kept) ---
 def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver):
     """Creates and compiles the LangGraph app with the appropriate memory saver."""
     
@@ -466,7 +440,6 @@ def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver):
     workflow.add_node("model", call_model)
 
     # Use the memory_saver passed (which is the global 'memory' object)
-    # The 'memory' object is guaranteed to be either RedisSaver or MemorySaver.
     compiled_app = workflow.compile(checkpointer=memory_saver)
     return compiled_app
 # --- END OF NEW HELPER FUNCTION ---
