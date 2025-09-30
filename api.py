@@ -13,7 +13,8 @@ from sqlmodel import SQLModel, Field, create_engine, Session, select
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langgraph.checkpoint.redis import RedisSaver
+# FIX 1: Import RedisCheckpoint instead of RedisSaver
+from langgraph.checkpoint.redis import RedisCheckpoint 
 from langgraph.graph import START, MessagesState, StateGraph
 
 load_dotenv()
@@ -47,10 +48,10 @@ origins = [
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,            
-    allow_credentials=True,           
-    allow_methods=["*"],              
-    allow_headers=["*"],              
+    allow_origins=origins, 
+    allow_credentials=True, 
+    allow_methods=["*"], 
+    allow_headers=["*"], 
 )
 
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -78,10 +79,11 @@ try:
         health_check_interval=15, 
         retry_on_timeout=True ,
         socket_timeout=10, 
-        max_connections=50  
+        max_connections=50 
     )
     redis_client.ping()
-    memory = RedisSaver(redis_client=redis_client) 
+    # FIX 2: Use RedisCheckpoint and set index_name=None to avoid the 'MODULE' command error
+    memory = RedisCheckpoint(client=redis_client, index_name=None) 
 except redis.exceptions.ConnectionError as e:
     print(f"Could not connect to Redis: {e}")
     print("Falling back to in-memory storage. Chat history will not persist.")
@@ -216,6 +218,7 @@ def get_chat_history(user_id: str):
         buddy_name = buddy_name or "Buddy"
         config = {"configurable": {"thread_id": user_id}}
         try:
+            # The 'memory' object is now the correctly configured RedisCheckpoint
             raw_state = memory.get(config) 
             messages_channel = raw_state.get('channel_values') if raw_state else None
             
