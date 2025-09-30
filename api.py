@@ -13,8 +13,7 @@ from sqlmodel import SQLModel, Field, create_engine, Session, select
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-# FIX 1: Revert the import name back to RedisSaver
-from langgraph.checkpoint.redis import RedisSaver
+from langgraph.checkpoint.redis import RedisSaver # Kept as RedisSaver from last fix
 from langgraph.graph import START, MessagesState, StateGraph
 
 load_dotenv()
@@ -82,8 +81,9 @@ try:
         max_connections=50 
     )
     redis_client.ping()
-    # FIX 2: Use RedisSaver but pass index_name=None to avoid the 'MODULE' command error
-    memory = RedisSaver(client=redis_client, index_name=None) 
+    # 💥 CRITICAL FIX: Removed 'client=' keyword. This prevents the TypeError.
+    # The 'index_name=None' still prevents the Upstash 'MODULE' command error.
+    memory = RedisSaver(redis_client, index_name=None) 
 except redis.exceptions.ConnectionError as e:
     print(f"Could not connect to Redis: {e}")
     print("Falling back to in-memory storage. Chat history will not persist.")
