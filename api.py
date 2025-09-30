@@ -13,7 +13,7 @@ from sqlmodel import SQLModel, Field, create_engine, Session, select
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-# Removed explicit imports for RedisSaver/MemorySaver to allow conditional import later
+# Conditional imports for RedisSaver/MemorySaver will be handled later
 from langgraph.graph import START, MessagesState, StateGraph
 from typing import cast 
 
@@ -70,57 +70,61 @@ def create_db_and_tables():
 REDIS_URL = os.getenv("REDIS_URL")
 
 # --------------------------------------------------------------------------------
-# --- START OF FINAL FIX: Conditional Checkpointer Initialization ---
+# --- START OF FINAL FIX: Robust Checkpointer Initialization ---
 redis_client = None 
 memory = None
+is_redis_compatible = False
+temp_redis_client = None
 
 try:
-    if not REDIS_URL:
-        # If URL is missing, skip to the MemorySaver fallback.
-        raise ValueError("REDIS_URL not set in environment. Skipping RedisSaver.")
-    
-    # 1. ATTEMPT CONNECTION
-    temp_redis_client = redis.from_url(
-        REDIS_URL,
-        db=0,
-        decode_responses=False, 
-        health_check_interval=15, 
-        retry_on_timeout=True,
-        socket_timeout=10, 
-        max_connections=50 
-    )
-    temp_redis_client.ping() # Check connection availability
+    if REDIS_URL:
+        # 1. ATTEMPT CONNECTION
+        temp_redis_client = redis.from_url(
+            REDIS_URL,
+            db=0,
+            decode_responses=False, 
+            health_check_interval=15, 
+            retry_on_timeout=True,
+            socket_timeout=10, 
+            max_connections=50 
+        )
+        temp_redis_client.ping() # Check basic connection
 
-    # 2. IF SUCCESSFUL, IMPORT AND SETUP RedisSaver
-    from langgraph.checkpoint.redis import RedisSaver
-    memory_saver_instance = RedisSaver(redis_client=temp_redis_client) 
-    
-    # If successful, assign to globals
-    redis_client = temp_redis_client
-    memory = memory_saver_instance
-    print("INFO: Successfully configured RedisSaver.")
-
-except Exception as e: 
-    # 3. HANDLE FAILURE (Any exception during setup, including 'MODULE' errors)
-    is_incompatible = isinstance(e, redis.exceptions.ConnectionError) or ("MODULE" in str(e) or "RedisVLError" in type(e).__name__)
-    
-    if is_incompatible or isinstance(e, ValueError):
-        # Force Redis client to None to disable all other Redis functions (e.g., blacklist)
-        redis_client = None 
+        # 2. CHECK COMPATIBILITY
+        try:
+            # This call triggers the MODULE LIST error on incompatible services
+            temp_redis_client.module_list() 
+            is_redis_compatible = True # Only set to True if MODULE LIST works
+        except redis.exceptions.ResponseError as module_error:
+            if "MODULE" in str(module_error):
+                # This is the expected error for incompatible services like Upstash.
+                print("INFO: Redis connection established, but 'MODULE' command is unsupported. Falling back to MemorySaver.")
+                temp_redis_client.close()
+                temp_redis_client = None
+            else:
+                # Re-raise for other unhandled response errors
+                raise module_error
         
-        # Fallback: ONLY IMPORT MemorySaver in this branch
-        from langgraph.checkpoint.memory import MemorySaver 
-        memory = MemorySaver()
-        print(f"INFO: Redis initialization failed due to incompatibility or connection error: {str(e)}. Falling back to in-memory chat history (MemorySaver).")
-    else:
-        # Re-raise for unknown critical exceptions 
-        raise e
+except Exception as e: 
+    # Catch all connection/initialization failures (e.g., REDIS_URL missing, connection refusal)
+    print(f"INFO: Redis connection/initialization failed: {str(e)}. Falling back to MemorySaver.")
+    temp_redis_client = None
+    is_redis_compatible = False
 
-# Ensure memory is set to MemorySaver even if REDIS_URL was missing (for safety)
-if memory is None:
+# 3. SET GLOBAL CHECKPOINTER BASED ON RESULT
+if is_redis_compatible and temp_redis_client:
+    # ONLY proceed with RedisSaver if both connection and MODULE command worked
+    from langgraph.checkpoint.redis import RedisSaver
+    memory = RedisSaver(redis_client=temp_redis_client) 
+    redis_client = temp_redis_client
+    print("INFO: Successfully configured RedisSaver.")
+else:
+    # Use MemorySaver in all other cases (REDIS_URL missing, connection failed, or MODULE failed)
     from langgraph.checkpoint.memory import MemorySaver 
     memory = MemorySaver()
-    print("INFO: REDIS_URL was not set. Defaulting to in-memory chat history (MemorySaver).")
+    redis_client = None # Ensure global redis client is None if not fully functional
+    if not REDIS_URL:
+        print("INFO: REDIS_URL was not set. Defaulting to in-memory chat history (MemorySaver).")
 
 # --- END OF FINAL FIX ---
 # --------------------------------------------------------------------------------
@@ -212,6 +216,7 @@ def save_initial_chat_context(user_id: str, ideal_friend: str, buddy_name: str):
                 "ideal_friend".encode('utf-8'): ideal_friend.encode('utf-8'),
                 "buddy_name".encode('utf-8'): buddy_name.encode('utf-8')
             }
+            # This uses the globally configured redis_client (which is None if incompatible)
             redis_client.hmset(f"context:{user_id}".encode('utf-8'), context_data) 
         except redis.exceptions.ConnectionError as e:
             pass
@@ -246,8 +251,8 @@ def get_chat_history(user_id: str):
             ideal_friend = None
             buddy_name = None
             
-    # CRITICAL: We use the global 'memory' object here, which is set to the correct
-    # checkpointer (RedisSaver or MemorySaver) during startup.
+    # CRITICAL: We use the global 'memory' object here, which is guaranteed to be 
+    # either RedisSaver (if compatible) OR MemorySaver (if incompatible/missing URL).
     if ideal_friend and buddy_name: 
         buddy_name = buddy_name or "Buddy"
         config = {"configurable": {"thread_id": user_id}}
@@ -422,7 +427,6 @@ def create_prompt_template(ideal_friend: str):
 
 model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 
-# --- NEW HELPER FUNCTION FOR GRAPH COMPILATION (ADDED in previous fix, kept) ---
 def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver):
     """Creates and compiles the LangGraph app with the appropriate memory saver."""
     
@@ -442,7 +446,6 @@ def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver):
     # Use the memory_saver passed (which is the global 'memory' object)
     compiled_app = workflow.compile(checkpointer=memory_saver)
     return compiled_app
-# --- END OF NEW HELPER FUNCTION ---
     
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current_user)):
@@ -462,19 +465,20 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
         current_ideal_friend = request.ideal_friend
         current_buddy_name = request.buddy_name
         
+        # Save context to Redis only if the client is functional
         save_initial_chat_context(user_id, current_ideal_friend, current_buddy_name)
     
     if not current_ideal_friend:
         raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) is required.")
         
-    # --- CORE FIX: Use helper function to compile graph with global 'memory' object ---
-    # This prevents the re-execution of RedisSaver internal checks inside the endpoint.
+    # Compile graph using the globally initialized and safe 'memory' object (RedisSaver or MemorySaver)
     compiled_app = create_compiled_app(user_id, current_ideal_friend, memory) 
-    # --- END CORE FIX ---
 
     config = {"configurable": {"thread_id": user_id}}
 
     input_messages = {"messages": [HumanMessage(content=user_message)]}
+    
+    # This is the line that will now safely use the MemorySaver if Redis is incompatible
     output = compiled_app.invoke(input_messages, config)
     
     model_response = output["messages"][-1]
