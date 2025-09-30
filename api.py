@@ -70,41 +70,59 @@ REDIS_URL = os.getenv("REDIS_URL")
 
 redis_client = None 
 memory = None
+is_redis_compatible = False
+temp_redis_client = None
 
 try:
-    if not REDIS_URL:
-        raise ValueError("REDIS_URL not set in environment. Skipping RedisSaver.")
-    temp_redis_client = redis.from_url(
-        REDIS_URL,
-        db=0,
-        decode_responses=False, 
-        health_check_interval=15, 
-        retry_on_timeout=True,
-        socket_timeout=10, 
-        max_connections=50 
-    )
-    temp_redis_client.ping()
-    from langgraph.checkpoint.redis import RedisSaver
-    memory_saver_instance = RedisSaver(redis_client=temp_redis_client) 
-    redis_client = temp_redis_client
-    memory = memory_saver_instance
-    print("INFO: Successfully configured RedisSaver.")
+    if REDIS_URL:
+        # 1. ATTEMPT CONNECTION
+        temp_redis_client = redis.from_url(
+            REDIS_URL,
+            db=0,
+            decode_responses=False, 
+            health_check_interval=15, 
+            retry_on_timeout=True,
+            socket_timeout=10, 
+            max_connections=50 
+        )
+        temp_redis_client.ping() # Check basic connection
 
+        # 2. CHECK COMPATIBILITY
+        try:
+            # This call triggers the MODULE LIST error on incompatible services
+            temp_redis_client.module_list() 
+            is_redis_compatible = True # Only set to True if MODULE LIST works
+        except redis.exceptions.ResponseError as module_error:
+            if "MODULE" in str(module_error):
+                # This is the expected error for incompatible services (Upstash)
+                print("INFO: Redis connection established, but 'MODULE' command is unsupported. Falling back to MemorySaver.")
+                temp_redis_client.close()
+                temp_redis_client = None
+            else:
+                # Re-raise for other unhandled response errors
+                raise module_error
+        
 except Exception as e: 
-    is_incompatible = isinstance(e, redis.exceptions.ConnectionError) or ("MODULE" in str(e) or "RedisVLError" in type(e).__name__)
-    
-    if is_incompatible or isinstance(e, ValueError):
-        redis_client = None 
-        from langgraph.checkpoint.memory import MemorySaver 
-        memory = MemorySaver()
-        print(f"INFO: Redis initialization failed due to incompatibility or connection error: {str(e)}. Falling back to in-memory chat history (MemorySaver).")
-    else:
-        raise e
+    # Catch all connection/initialization failures (e.g., REDIS_URL missing, connection refusal)
+    print(f"INFO: Redis connection/initialization failed: {str(e)}. Falling back to MemorySaver.")
+    temp_redis_client = None
+    is_redis_compatible = False
 
-if memory is None:
+# 3. SET GLOBAL CHECKPOINTER BASED ON RESULT
+if is_redis_compatible and temp_redis_client:
+    # ONLY proceed with RedisSaver if both connection and MODULE command worked
+    from langgraph.checkpoint.redis import RedisSaver
+    memory = RedisSaver(redis_client=temp_redis_client) 
+    redis_client = temp_redis_client
+    print("INFO: Successfully configured RedisSaver.")
+else:
+    # Use MemorySaver in all other cases (REDIS_URL missing, connection failed, or MODULE failed)
     from langgraph.checkpoint.memory import MemorySaver 
+    # CRITICAL FIX: Ensure the global 'memory' object is a simple MemorySaver instance.
     memory = MemorySaver()
-    print("INFO: REDIS_URL was not set. Defaulting to in-memory chat history (MemorySaver).")
+    redis_client = None # Ensure global redis client is None if not fully functional
+    if not REDIS_URL:
+        print("INFO: REDIS_URL was not set. Defaulting to in-memory chat history (MemorySaver).")
 
 def get_disposable_redis_client():
     """
