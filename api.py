@@ -14,6 +14,8 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.checkpoint.redis import RedisSaver
+# FIX: Import MemorySaver here so it's available in the fallback
+from langgraph.checkpoint.memory import MemorySaver 
 from langgraph.graph import START, MessagesState, StateGraph
 
 load_dotenv()
@@ -66,12 +68,13 @@ def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
 REDIS_URL = os.getenv("REDIS_URL")
-REDIS_URL = os.getenv("REDIS_URL")
 
+# --- START OF FIX: Robust Redis/LangGraph Checkpointer Initialization ---
 redis_client = None 
 try:
     if not REDIS_URL:
-        raise redis.exceptions.ConnectionError("REDIS_URL not set in environment.")
+        # Raise a general exception if URL is missing, to trigger the generic fallback path
+        raise Exception("REDIS_URL not set in environment.") 
     
     # 1. ATTEMPT CONNECTION
     temp_redis_client = redis.from_url(
@@ -86,6 +89,7 @@ try:
     temp_redis_client.ping() # Check connection availability
 
     # 2. ATTEMPT CHECKPOINTER SETUP (This is where 'MODULE' fails)
+    # The RedisSaver initialization calls redisvl which attempts MODULE LIST
     memory = RedisSaver(redis_client=temp_redis_client) 
     
     # If both succeed, set the global client
@@ -93,22 +97,27 @@ try:
     
 except Exception as e: 
     # 3. HANDLE FAILURE
+    # Check for ConnectionError, the specific 'MODULE' error string, or the RedisVLError class name
     is_redis_incompatible = isinstance(e, redis.exceptions.ConnectionError) or ("MODULE" in str(e) or "index_name" in str(e) or "RedisVLError" in type(e).__name__)
     
-    if is_redis_incompatible:
+    if is_redis_incompatible or "REDIS_URL not set" in str(e):
         # Crucially, force the global client to None if it fails.
         redis_client = None 
-        from langgraph.checkpoint.memory import MemorySaver
+        # MemorySaver is now imported at the top
         memory = MemorySaver()
+        print("INFO: Redis connection failed or is incompatible ('MODULE' command blocked). Falling back to in-memory chat history (MemorySaver).")
     else:
+        # Re-raise for unknown/unhandled critical exceptions
         raise e
+# --- END OF FIX ---
+
 
 def get_disposable_redis_client():
     """
     Creates a new, short-lived Redis client instance for critical reads.
     Always uses decode_responses=False.
     """
-    if not REDIS_URL:
+    if not REDIS_URL or not redis_client: # Also check if global client failed initialization
         return None
         
     return redis.from_url(
@@ -120,6 +129,38 @@ def get_disposable_redis_client():
         max_connections=1 
     )
 
+
+# ... rest of your file (verbatim) ...
+
+def add_to_token_blacklist(token: str, expiration: datetime):
+    if redis_client:
+        try:
+            now = datetime.now(timezone.utc)
+            time_to_expire = int((expiration - now).total_seconds())
+            if time_to_expire > 0:
+                # This uses the global redis_client which is None if the connection failed
+                redis_client.set(f"blacklist:{token}".encode('utf-8'), b"revoked", ex=time_to_expire) 
+                return True
+        except redis.exceptions.ConnectionError as e:
+            return False
+    return False
+
+def is_token_blacklisted(token: str):
+    """
+    Checks if a token is blacklisted using a disposable client for high reliability.
+    """
+    # The get_disposable_redis_client function will return None if redis_client is None
+    r = get_disposable_redis_client() 
+    if not r:
+        return False
+        
+    try:
+        r.ping() 
+        return r.get(f"blacklist:{token}".encode('utf-8')) is not None
+    except redis.exceptions.ConnectionError as e:
+        return False 
+    except Exception as e:
+        return False
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
