@@ -19,7 +19,6 @@ from typing import cast
 
 load_dotenv()
 
-# --- ENVIRONMENT VARIABLE CHECKS ---
 if "LANGSMITH_API_KEY" not in os.environ or not os.getenv("LANGSMITH_API_KEY"):
     raise EnvironmentError("LANGSMITH_API_KEY environment variable is missing. Deployment aborted.")
 
@@ -66,9 +65,6 @@ def create_db_and_tables():
     SQLModel.metadata.create_all(engine)
 
 REDIS_URL = os.getenv("REDIS_URL")
-
-# --------------------------------------------------------------------------------
-# --- GLOBAL INITIALIZATION: ROBUST CHECKPOINTER CONFIGURATION ---
 redis_client = None 
 memory = None
 is_redis_compatible = False
@@ -76,7 +72,6 @@ temp_redis_client = None
 
 try:
     if REDIS_URL:
-        # 1. ATTEMPT CONNECTION
         temp_redis_client = redis.from_url(
             REDIS_URL,
             db=0,
@@ -87,8 +82,6 @@ try:
             max_connections=50 
         )
         temp_redis_client.ping()
-
-        # 2. CHECK COMPATIBILITY 
         try:
             temp_redis_client.module_list() 
             is_redis_compatible = True
@@ -104,24 +97,17 @@ except Exception as e:
     print(f"INFO: Redis connection/initialization failed: {str(e)}. Falling back to MemorySaver.")
     temp_redis_client = None
     is_redis_compatible = False
-
-# 3. SET GLOBAL CHECKPOINTER BASED ON RESULT
 if is_redis_compatible and temp_redis_client:
     from langgraph.checkpoint.redis import RedisSaver
     memory = RedisSaver(redis_client=temp_redis_client) 
     redis_client = temp_redis_client
     print("INFO: Successfully configured RedisSaver.")
 else:
-    # Use MemorySaver in all other cases
     from langgraph.checkpoint.memory import MemorySaver 
     memory = MemorySaver()
     redis_client = None
     if not REDIS_URL:
         print("INFO: REDIS_URL was not set. Defaulting to in-memory chat history (MemorySaver).")
-
-# --- END OF GLOBAL INITIALIZATION ---
-# --------------------------------------------------------------------------------
-
 
 def get_disposable_redis_client():
     """
@@ -195,9 +181,6 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     return user_id
 
 
-# --- DELETED OLD save_initial_chat_context FUNCTION (replaced by SQL logic) ---
-
-
 def get_chat_history(user_id: str):
     """
     Retrieves chat history from LangGraph and configuration from the SQL database.
@@ -205,25 +188,18 @@ def get_chat_history(user_id: str):
     history = []
     ideal_friend = None
     buddy_name = None
-    
-    # 1. Get initial context (ideal_friend, buddy_name) from SQL Database (Primary Source)
     try:
         with Session(engine) as session:
             statement = select(User).where(User.id == uuid.UUID(user_id))
             user = session.exec(statement).first()
             if user:
-                # Use the new DB fields
                 ideal_friend = user.ideal_friend_config
                 buddy_name = user.buddy_name
     except Exception:
-        # If DB read fails, assume no config
         pass
-            
-    # 2. If configuration is available, try to retrieve chat history from LangGraph checkpointer
     if ideal_friend and buddy_name: 
         config = {"configurable": {"thread_id": user_id}}
         try:
-            # memory is guaranteed to be either RedisSaver (compatible) or MemorySaver
             raw_state = memory.get(config) 
             messages_channel = raw_state.get('channel_values') if raw_state else None
             
@@ -254,10 +230,8 @@ class User(SQLModel, table=True):
     username: str = Field(unique=True, index=True)
     email: str = Field(unique=True, index=True)
     hashed_password: str
-    # --- NEW FIELDS FOR PERSISTENT CONFIGURATION (FIX) ---
     ideal_friend_config: str | None = Field(default=None)
     buddy_name: str | None = Field(default=None)
-    # ----------------------------------------------------
 
 class UserCreate(BaseModel):
     username: str
@@ -271,7 +245,6 @@ class LoginResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    # FIX: Make personality fields optional for subsequent messages (Fixes 422 error)
     ideal_friend: str | None = None 
     buddy_name: str | None = None
 
@@ -306,7 +279,6 @@ def signup(user_data: UserCreate):
             username=user_data.username,
             email=user_data.email,
             hashed_password=hashed_password,
-            # New users have no config yet
             ideal_friend_config=None,
             buddy_name=None
         )
@@ -318,7 +290,6 @@ def signup(user_data: UserCreate):
         access_token = create_access_token(
             data={"sub": str(new_user.id)}, expires_delta=access_token_expires
         )
-        # New users always return has_buddy=False
         return {"access_token": access_token, "token_type": "bearer", "has_buddy": False}
     
 @app.post("/api/login", response_model=LoginResponse)
@@ -334,7 +305,6 @@ def login(user_data: UserCreate):
             data={"sub": str(user.id)}, expires_delta=access_token_expires
         )
 
-    # FIX: Check config directly from the User object (DB). (Fixes incorrect redirection)
     has_buddy = bool(user.ideal_friend_config and user.buddy_name) 
 
     return {
@@ -393,12 +363,9 @@ def create_prompt_template(ideal_friend: str):
             MessagesPlaceholder(variable_name="messages"),
         ]
     )
-
-# Model is kept globally as it is stateless and efficient to reuse
 model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-# UPDATE THIS FUNCTION
 def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver, llm_model):
     """
     Creates and compiles the LangGraph app with the appropriate memory saver.
@@ -407,11 +374,8 @@ def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver, l
     prompt_template = create_prompt_template(current_ideal_friend)
     
     workflow = StateGraph(state_schema=MessagesState)
-
-    # The inner function needs to capture the llm_model passed to the outer function
     def call_model(state: MessagesState):
         prompt = prompt_template.invoke(state)
-        # Use the passed-in model
         response = llm_model.invoke(prompt) 
         return {"messages": [response]}
 
@@ -422,17 +386,12 @@ def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver, l
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current_user)):
     user_message = request.message
-    
-    # 1. Retrieve current stored context
     stored_context = get_chat_history(user_id) 
     stored_ideal_friend = stored_context.get('ideal_friend')
     stored_buddy_name = stored_context.get('buddy_name')
     
     current_ideal_friend = stored_ideal_friend
-    
-    # --- 2. HANDLE INITIAL CONFIGURATION (if context is missing) ---
     if not stored_ideal_friend:
-        # Enforce the requirement only on the first setup call
         if not request.ideal_friend or not request.buddy_name:
             raise HTTPException(
                 status_code=400, 
@@ -441,8 +400,6 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
 
         current_ideal_friend = request.ideal_friend
         current_buddy_name = request.buddy_name
-        
-        # 🚨 CRITICAL FIX: Save context permanently to SQL DB 
         try:
             with Session(engine) as session:
                 user_id_uuid = uuid.UUID(user_id)
@@ -453,19 +410,13 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
                     session.add(user)
                     session.commit()
         except Exception as e:
-            # Note: We let the chat proceed even if save fails, but warn.
             print(f"WARNING: Failed to save buddy configuration to database: {e}")
-    
-    # 3. Final check (should not fail if logic above is correct)
     if not current_ideal_friend:
         raise HTTPException(
             status_code=400, 
             detail="Buddy personality is required to start chatting."
         )
-        
-    # --- 4. COMPILE AND INVOKE CHAT (with error handling) ---
     try:
-        # FIX: Ensure you pass 'model' as the fourth argument, based on the required function signature
         compiled_app = create_compiled_app(user_id, current_ideal_friend, memory, model) 
 
         config = {"configurable": {"thread_id": user_id}}
@@ -478,6 +429,5 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
         return {"response": model_response.content}
         
     except Exception as e:
-        # Graceful failure on chat execution
         print(f"ERROR during compiled_app.invoke or state saving: {e}")
         return {"response": "Oops! I ran into an issue while trying to think of a response or save our chat. Please try again in a moment."}
