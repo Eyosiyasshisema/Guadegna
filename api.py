@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from sqlmodel import SQLModel, Field, create_engine, Session, select
-from langchain_google_genai import ChatGoogleGenerAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import START, MessagesState, StateGraph
@@ -395,7 +395,7 @@ def create_prompt_template(ideal_friend: str):
     )
 
 # Model is kept globally as it is stateless and efficient to reuse
-model = ChatGoogleGenerAI(model="gemini-2.5-flash")
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver):
     """
