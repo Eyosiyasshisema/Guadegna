@@ -395,6 +395,7 @@ def create_prompt_template(ideal_friend: str):
     )
 
 # Model is kept globally as it is stateless and efficient to reuse
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # UPDATE THIS FUNCTION
