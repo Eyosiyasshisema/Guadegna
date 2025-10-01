@@ -10,7 +10,7 @@ from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from sqlmodel import SQLModel, Field, create_engine, Session, select
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.graph import START, MessagesState, StateGraph
@@ -88,7 +88,7 @@ try:
         )
         temp_redis_client.ping()
 
-        # 2. CHECK COMPATIBILITY (This is the section that fails on Upstash)
+        # 2. CHECK COMPATIBILITY 
         try:
             temp_redis_client.module_list() 
             is_redis_compatible = True
@@ -195,46 +195,31 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     return user_id
 
 
-def save_initial_chat_context(user_id: str, ideal_friend: str, buddy_name: str):
-    """Saves the user's defined ideal friend characteristics and name to Redis (uses global client)."""
-    if redis_client:
-        try:
-            context_data = {
-                "ideal_friend".encode('utf-8'): ideal_friend.encode('utf-8'),
-                "buddy_name".encode('utf-8'): buddy_name.encode('utf-8')
-            }
-            # Use the global client for saving. This client passed the compatibility check or is None.
-            redis_client.hmset(f"context:{user_id}".encode('utf-8'), context_data) 
-        except redis.exceptions.ConnectionError:
-            pass
-    # No else block needed; context is not saved if Redis fails/is not configured.
+# --- DELETED OLD save_initial_chat_context FUNCTION (replaced by SQL logic) ---
+
 
 def get_chat_history(user_id: str):
     """
-    Retrieves chat history and ideal friend characteristics from Redis/LangGraph.
-    FIXED: Handles missing data more robustly to correctly determine 'has_buddy'.
+    Retrieves chat history from LangGraph and configuration from the SQL database.
     """
     history = []
     ideal_friend = None
     buddy_name = None
     
-    # 1. Get initial context (ideal_friend, buddy_name) from Redis
-    r = get_disposable_redis_client()
-    if r:
-        try:
-            context_data = r.hgetall(f"context:{user_id}".encode('utf-8'))
-            ideal_friend_bytes = context_data.get(b"ideal_friend")
-            buddy_name_bytes = context_data.get(b"buddy_name")
+    # 1. Get initial context (ideal_friend, buddy_name) from SQL Database (Primary Source)
+    try:
+        with Session(engine) as session:
+            statement = select(User).where(User.id == uuid.UUID(user_id))
+            user = session.exec(statement).first()
+            if user:
+                # Use the new DB fields
+                ideal_friend = user.ideal_friend_config
+                buddy_name = user.buddy_name
+    except Exception:
+        # If DB read fails, assume no config
+        pass
             
-            if ideal_friend_bytes:
-                ideal_friend = ideal_friend_bytes.decode('utf-8')
-            if buddy_name_bytes:
-                buddy_name = buddy_name_bytes.decode('utf-8')
-        except Exception:
-            # Silence all errors during context retrieval, assume no context if any error occurs
-            pass
-            
-    # 2. If context is available, try to retrieve chat history from LangGraph checkpointer
+    # 2. If configuration is available, try to retrieve chat history from LangGraph checkpointer
     if ideal_friend and buddy_name: 
         config = {"configurable": {"thread_id": user_id}}
         try:
@@ -255,8 +240,6 @@ def get_chat_history(user_id: str):
                         "content": msg.content
                     })
         except Exception:
-            # If the checkpointer fails to get state (e.g., MemorySaver lost data, or minor Redis glitch)
-            # We proceed with empty history, but still mark has_buddy=True since context is present.
             pass
 
     return {
@@ -271,6 +254,10 @@ class User(SQLModel, table=True):
     username: str = Field(unique=True, index=True)
     email: str = Field(unique=True, index=True)
     hashed_password: str
+    # --- NEW FIELDS FOR PERSISTENT CONFIGURATION (FIX) ---
+    ideal_friend_config: str | None = Field(default=None)
+    buddy_name: str | None = Field(default=None)
+    # ----------------------------------------------------
 
 class UserCreate(BaseModel):
     username: str
@@ -284,8 +271,9 @@ class LoginResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    ideal_friend: str 
-    buddy_name: str 
+    # FIX: Make personality fields optional for subsequent messages (Fixes 422 error)
+    ideal_friend: str | None = None 
+    buddy_name: str | None = None
 
 class ChatHistoryResponse(BaseModel):
     ideal_friend: str | None = None
@@ -317,7 +305,10 @@ def signup(user_data: UserCreate):
         new_user = User(
             username=user_data.username,
             email=user_data.email,
-            hashed_password=hashed_password
+            hashed_password=hashed_password,
+            # New users have no config yet
+            ideal_friend_config=None,
+            buddy_name=None
         )
         session.add(new_user)
         session.commit()
@@ -327,6 +318,7 @@ def signup(user_data: UserCreate):
         access_token = create_access_token(
             data={"sub": str(new_user.id)}, expires_delta=access_token_expires
         )
+        # New users always return has_buddy=False
         return {"access_token": access_token, "token_type": "bearer", "has_buddy": False}
     
 @app.post("/api/login", response_model=LoginResponse)
@@ -342,14 +334,8 @@ def login(user_data: UserCreate):
             data={"sub": str(user.id)}, expires_delta=access_token_expires
         )
 
-    # 1. Fetch context. This will use the (possibly non-functional) Redis connection.
-    try:
-        context = get_chat_history(str(user.id))
-        # 2. Check if the initial personality data is present.
-        has_buddy = bool(context['ideal_friend'] and context['buddy_name'])
-    except Exception:
-        # If get_chat_history itself fails due to an unexpected reason, assume no buddy is configured.
-        has_buddy = False 
+    # FIX: Check config directly from the User object (DB). (Fixes incorrect redirection)
+    has_buddy = bool(user.ideal_friend_config and user.buddy_name) 
 
     return {
         "access_token": access_token, 
@@ -382,7 +368,6 @@ def logout(request: Request, user_id: str = Depends(get_current_user)):
 async def get_history_endpoint(user_id: str = Depends(get_current_user)):
     """
     Fetches the conversation history and the ideal friend context.
-    The frontend should only call this *after* a successful login with has_buddy=true.
     """
     history_data = get_chat_history(user_id)
     
@@ -409,10 +394,14 @@ def create_prompt_template(ideal_friend: str):
         ]
     )
 
-model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+# Model is kept globally as it is stateless and efficient to reuse
+model = ChatGoogleGenerAI(model="gemini-2.5-flash")
 
 def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver):
-    """Creates and compiles the LangGraph app with the appropriate memory saver."""
+    """
+    Creates and compiles the LangGraph app with the appropriate memory saver.
+    FIX: The prompt is dynamically created using the user's current_ideal_friend.
+    """
     prompt_template = create_prompt_template(current_ideal_friend)
     
     workflow = StateGraph(state_schema=MessagesState)
@@ -441,27 +430,38 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
 
     # --- 1. HANDLE INITIAL CONFIGURATION (if context is missing) ---
     if not stored_ideal_friend:
+        # Enforce the requirement only on the first setup call
         if not request.ideal_friend or not request.buddy_name:
              raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) and name are required for first chat call.")
 
         current_ideal_friend = request.ideal_friend
         current_buddy_name = request.buddy_name
         
-        # Save context to Redis only if the client is functional
-        save_initial_chat_context(user_id, current_ideal_friend, current_buddy_name)
+        # FIX: Save context permanently to SQL DB
+        try:
+            with Session(engine) as session:
+                user_id_uuid = uuid.UUID(user_id)
+                user = session.get(User, user_id_uuid)
+                if user:
+                    user.ideal_friend_config = current_ideal_friend
+                    user.buddy_name = current_buddy_name
+                    session.add(user)
+                    session.commit()
+        except Exception as e:
+            print(f"WARNING: Failed to save buddy configuration to database: {e}")
     
     if not current_ideal_friend:
-        # Should not happen after the check above, but for safety
+        # Should not happen after the check above, but as a final guard
         raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) is required.")
         
     # --- 2. COMPILE AND INVOKE CHAT (with error handling) ---
     try:
+        # FIX: Use the dynamic creator to avoid stale data (stale data fix)
         compiled_app = create_compiled_app(user_id, current_ideal_friend, memory) 
 
         config = {"configurable": {"thread_id": user_id}}
 
         input_messages = {"messages": [HumanMessage(content=user_message)]}
-        # This is the call that was crashing/failing silently
         output = compiled_app.invoke(input_messages, config)
         
         model_response = output["messages"][-1]
@@ -469,7 +469,6 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
         return {"response": model_response.content}
         
     except Exception as e:
-        # CRITICAL: Catch all errors during the LLM call/state saving and return a graceful message.
-        # This prevents the app from returning a generic 500 error and gives a clue to the user.
+        # Graceful failure on chat execution
         print(f"ERROR during compiled_app.invoke or state saving: {e}")
         return {"response": "Oops! I ran into an issue while trying to think of a response or save our chat. Please try again in a moment."}
