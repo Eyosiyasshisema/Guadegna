@@ -397,47 +397,51 @@ def create_prompt_template(ideal_friend: str):
 # Model is kept globally as it is stateless and efficient to reuse
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver):
+# UPDATE THIS FUNCTION
+def create_compiled_app(user_id: str, current_ideal_friend: str, memory_saver, llm_model):
     """
     Creates and compiles the LangGraph app with the appropriate memory saver.
-    FIX: The prompt is dynamically created using the user's current_ideal_friend.
+    llm_model (ChatGoogleGenerativeAI) is passed in to resolve scope issues.
     """
     prompt_template = create_prompt_template(current_ideal_friend)
     
     workflow = StateGraph(state_schema=MessagesState)
 
+    # The inner function needs to capture the llm_model passed to the outer function
     def call_model(state: MessagesState):
         prompt = prompt_template.invoke(state)
-        response = model.invoke(prompt)
+        # Use the passed-in model
+        response = llm_model.invoke(prompt) 
         return {"messages": [response]}
 
     workflow.add_edge(START, "model")
     workflow.add_node("model", call_model)
     compiled_app = workflow.compile(checkpointer=memory_saver)
     return compiled_app
-
-    
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current_user)):
     user_message = request.message
     
+    # 1. Retrieve current stored context
     stored_context = get_chat_history(user_id) 
     stored_ideal_friend = stored_context.get('ideal_friend')
     stored_buddy_name = stored_context.get('buddy_name')
     
     current_ideal_friend = stored_ideal_friend
-    current_buddy_name = stored_buddy_name
-
-    # --- 1. HANDLE INITIAL CONFIGURATION (if context is missing) ---
+    
+    # --- 2. HANDLE INITIAL CONFIGURATION (if context is missing) ---
     if not stored_ideal_friend:
         # Enforce the requirement only on the first setup call
         if not request.ideal_friend or not request.buddy_name:
-             raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) and name are required for first chat call.")
+            raise HTTPException(
+                status_code=400, 
+                detail="Buddy personality (ideal_friend) and name are required for first chat call."
+            )
 
         current_ideal_friend = request.ideal_friend
         current_buddy_name = request.buddy_name
         
-        # FIX: Save context permanently to SQL DB
+        # 🚨 CRITICAL FIX: Save context permanently to SQL DB 
         try:
             with Session(engine) as session:
                 user_id_uuid = uuid.UUID(user_id)
@@ -448,16 +452,20 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
                     session.add(user)
                     session.commit()
         except Exception as e:
+            # Note: We let the chat proceed even if save fails, but warn.
             print(f"WARNING: Failed to save buddy configuration to database: {e}")
     
+    # 3. Final check (should not fail if logic above is correct)
     if not current_ideal_friend:
-        # Should not happen after the check above, but as a final guard
-        raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) is required.")
+        raise HTTPException(
+            status_code=400, 
+            detail="Buddy personality is required to start chatting."
+        )
         
-    # --- 2. COMPILE AND INVOKE CHAT (with error handling) ---
+    # --- 4. COMPILE AND INVOKE CHAT (with error handling) ---
     try:
-        # FIX: Use the dynamic creator to avoid stale data (stale data fix)
-        compiled_app = create_compiled_app(user_id, current_ideal_friend, memory) 
+        # FIX: Ensure you pass 'model' as the fourth argument, based on the required function signature
+        compiled_app = create_compiled_app(user_id, current_ideal_friend, memory, model) 
 
         config = {"configurable": {"thread_id": user_id}}
 
