@@ -19,16 +19,15 @@ from typing import cast
 
 load_dotenv()
 
-if "LANGSMITH_API_KEY" not in os.environ:
-    if not os.getenv("LANGSMITH_API_KEY"):
-        raise EnvironmentError("LANGSMITH_API_KEY environment variable is missing. Deployment aborted.")
+# --- ENVIRONMENT VARIABLE CHECKS ---
+if "LANGSMITH_API_KEY" not in os.environ or not os.getenv("LANGSMITH_API_KEY"):
+    raise EnvironmentError("LANGSMITH_API_KEY environment variable is missing. Deployment aborted.")
 
 if "LANGSMITH_PROJECT" not in os.environ:
     os.environ["LANGSMITH_PROJECT"] = "default"
 
-if "GOOGLE_API_KEY" not in os.environ:
-    if not os.getenv("GOOGLE_API_KEY"):
-        raise EnvironmentError("GOOGLE_API_KEY environment variable is missing. Deployment aborted.")
+if "GOOGLE_API_KEY" not in os.environ or not os.getenv("GOOGLE_API_KEY"):
+    raise EnvironmentError("GOOGLE_API_KEY environment variable is missing. Deployment aborted.")
         
 if "SECRET_KEY" not in os.environ:
     raise EnvironmentError("SECRET_KEY environment variable is missing. Deployment aborted.")
@@ -68,6 +67,8 @@ def create_db_and_tables():
 
 REDIS_URL = os.getenv("REDIS_URL")
 
+# --------------------------------------------------------------------------------
+# --- GLOBAL INITIALIZATION: ROBUST CHECKPOINTER CONFIGURATION ---
 redis_client = None 
 memory = None
 is_redis_compatible = False
@@ -85,49 +86,47 @@ try:
             socket_timeout=10, 
             max_connections=50 
         )
-        temp_redis_client.ping() # Check basic connection
+        temp_redis_client.ping()
 
-        # 2. CHECK COMPATIBILITY
+        # 2. CHECK COMPATIBILITY (This is the section that fails on Upstash)
         try:
-            # This call triggers the MODULE LIST error on incompatible services
             temp_redis_client.module_list() 
-            is_redis_compatible = True # Only set to True if MODULE LIST works
+            is_redis_compatible = True
         except redis.exceptions.ResponseError as module_error:
             if "MODULE" in str(module_error):
-                # This is the expected error for incompatible services (Upstash)
                 print("INFO: Redis connection established, but 'MODULE' command is unsupported. Falling back to MemorySaver.")
                 temp_redis_client.close()
                 temp_redis_client = None
             else:
-                # Re-raise for other unhandled response errors
                 raise module_error
         
 except Exception as e: 
-    # Catch all connection/initialization failures (e.g., REDIS_URL missing, connection refusal)
     print(f"INFO: Redis connection/initialization failed: {str(e)}. Falling back to MemorySaver.")
     temp_redis_client = None
     is_redis_compatible = False
 
 # 3. SET GLOBAL CHECKPOINTER BASED ON RESULT
 if is_redis_compatible and temp_redis_client:
-    # ONLY proceed with RedisSaver if both connection and MODULE command worked
     from langgraph.checkpoint.redis import RedisSaver
     memory = RedisSaver(redis_client=temp_redis_client) 
     redis_client = temp_redis_client
     print("INFO: Successfully configured RedisSaver.")
 else:
-    # Use MemorySaver in all other cases (REDIS_URL missing, connection failed, or MODULE failed)
+    # Use MemorySaver in all other cases
     from langgraph.checkpoint.memory import MemorySaver 
-    # CRITICAL FIX: Ensure the global 'memory' object is a simple MemorySaver instance.
     memory = MemorySaver()
-    redis_client = None # Ensure global redis client is None if not fully functional
+    redis_client = None
     if not REDIS_URL:
         print("INFO: REDIS_URL was not set. Defaulting to in-memory chat history (MemorySaver).")
+
+# --- END OF GLOBAL INITIALIZATION ---
+# --------------------------------------------------------------------------------
+
 
 def get_disposable_redis_client():
     """
     Creates a new, short-lived Redis client instance for critical reads.
-    Always uses decode_responses=False.
+    Returns None if global redis_client is None or REDIS_URL is not set.
     """
     if not REDIS_URL or not redis_client: 
         return None
@@ -154,10 +153,6 @@ def add_to_token_blacklist(token: str, expiration: datetime):
     return False
 
 def is_token_blacklisted(token: str):
-    """
-    Checks if a token is blacklisted using a disposable client for high reliability.
-    """
-
     r = get_disposable_redis_client() 
     if not r:
         return False
@@ -165,9 +160,9 @@ def is_token_blacklisted(token: str):
     try:
         r.ping() 
         return r.get(f"blacklist:{token}".encode('utf-8')) is not None
-    except redis.exceptions.ConnectionError as e:
+    except redis.exceptions.ConnectionError:
         return False 
-    except Exception as e:
+    except Exception:
         return False
 
 def verify_password(plain_password, hashed_password):
@@ -195,7 +190,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         user_id: str = payload.get("sub")
         if user_id is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token")
-    except jwt.JWTError as e:
+    except jwt.JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token")
     return user_id
 
@@ -208,24 +203,25 @@ def save_initial_chat_context(user_id: str, ideal_friend: str, buddy_name: str):
                 "ideal_friend".encode('utf-8'): ideal_friend.encode('utf-8'),
                 "buddy_name".encode('utf-8'): buddy_name.encode('utf-8')
             }
+            # Use the global client for saving. This client passed the compatibility check or is None.
             redis_client.hmset(f"context:{user_id}".encode('utf-8'), context_data) 
-        except redis.exceptions.ConnectionError as e:
+        except redis.exceptions.ConnectionError:
             pass
-    else:
-        pass
+    # No else block needed; context is not saved if Redis fails/is not configured.
 
 def get_chat_history(user_id: str):
     """
     Retrieves chat history and ideal friend characteristics from Redis/LangGraph.
-    Uses disposable client for critical initial context retrieval.
+    FIXED: Handles missing data more robustly to correctly determine 'has_buddy'.
     """
     history = []
     ideal_friend = None
     buddy_name = None
+    
+    # 1. Get initial context (ideal_friend, buddy_name) from Redis
     r = get_disposable_redis_client()
     if r:
         try:
-            r.ping() 
             context_data = r.hgetall(f"context:{user_id}".encode('utf-8'))
             ideal_friend_bytes = context_data.get(b"ideal_friend")
             buddy_name_bytes = context_data.get(b"buddy_name")
@@ -234,18 +230,15 @@ def get_chat_history(user_id: str):
                 ideal_friend = ideal_friend_bytes.decode('utf-8')
             if buddy_name_bytes:
                 buddy_name = buddy_name_bytes.decode('utf-8')
-                
-        except redis.exceptions.ConnectionError as e:
-            ideal_friend = None
-            buddy_name = None
-        except Exception as e:
-            ideal_friend = None
-            buddy_name = None
+        except Exception:
+            # Silence all errors during context retrieval, assume no context if any error occurs
+            pass
             
+    # 2. If context is available, try to retrieve chat history from LangGraph checkpointer
     if ideal_friend and buddy_name: 
-        buddy_name = buddy_name or "Buddy"
         config = {"configurable": {"thread_id": user_id}}
         try:
+            # memory is guaranteed to be either RedisSaver (compatible) or MemorySaver
             raw_state = memory.get(config) 
             messages_channel = raw_state.get('channel_values') if raw_state else None
             
@@ -255,16 +248,15 @@ def get_chat_history(user_id: str):
                     if isinstance(msg, SystemMessage):
                         continue 
 
-                    sender_type = 'human'
-                    if isinstance(msg, AIMessage):
-                        sender_type = 'ai'
-
+                    sender_type = 'human' if isinstance(msg, HumanMessage) else 'ai'
+                    
                     history.append({
                         "sender": sender_type,
                         "content": msg.content
                     })
-        except Exception as e:
-            # If the checkpointer fails to get state, we continue with an empty history
+        except Exception:
+            # If the checkpointer fails to get state (e.g., MemorySaver lost data, or minor Redis glitch)
+            # We proceed with empty history, but still mark has_buddy=True since context is present.
             pass
 
     return {
@@ -350,10 +342,13 @@ def login(user_data: UserCreate):
             data={"sub": str(user.id)}, expires_delta=access_token_expires
         )
 
+    # 1. Fetch context. This will use the (possibly non-functional) Redis connection.
     try:
         context = get_chat_history(str(user.id))
+        # 2. Check if the initial personality data is present.
         has_buddy = bool(context['ideal_friend'] and context['buddy_name'])
-    except Exception as e:
+    except Exception:
+        # If get_chat_history itself fails due to an unexpected reason, assume no buddy is configured.
         has_buddy = False 
 
     return {
@@ -444,6 +439,7 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
     current_ideal_friend = stored_ideal_friend
     current_buddy_name = stored_buddy_name
 
+    # --- 1. HANDLE INITIAL CONFIGURATION (if context is missing) ---
     if not stored_ideal_friend:
         if not request.ideal_friend or not request.buddy_name:
              raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) and name are required for first chat call.")
@@ -451,18 +447,29 @@ async def chat_endpoint(request: ChatRequest, user_id: str = Depends(get_current
         current_ideal_friend = request.ideal_friend
         current_buddy_name = request.buddy_name
         
+        # Save context to Redis only if the client is functional
         save_initial_chat_context(user_id, current_ideal_friend, current_buddy_name)
     
     if not current_ideal_friend:
+        # Should not happen after the check above, but for safety
         raise HTTPException(status_code=400, detail="Buddy personality (ideal_friend) is required.")
         
-    compiled_app = create_compiled_app(user_id, current_ideal_friend, memory) 
+    # --- 2. COMPILE AND INVOKE CHAT (with error handling) ---
+    try:
+        compiled_app = create_compiled_app(user_id, current_ideal_friend, memory) 
 
-    config = {"configurable": {"thread_id": user_id}}
+        config = {"configurable": {"thread_id": user_id}}
 
-    input_messages = {"messages": [HumanMessage(content=user_message)]}
-    output = compiled_app.invoke(input_messages, config)
-    
-    model_response = output["messages"][-1]
-    
-    return {"response": model_response.content}
+        input_messages = {"messages": [HumanMessage(content=user_message)]}
+        # This is the call that was crashing/failing silently
+        output = compiled_app.invoke(input_messages, config)
+        
+        model_response = output["messages"][-1]
+        
+        return {"response": model_response.content}
+        
+    except Exception as e:
+        # CRITICAL: Catch all errors during the LLM call/state saving and return a graceful message.
+        # This prevents the app from returning a generic 500 error and gives a clue to the user.
+        print(f"ERROR during compiled_app.invoke or state saving: {e}")
+        return {"response": "Oops! I ran into an issue while trying to think of a response or save our chat. Please try again in a moment."}
